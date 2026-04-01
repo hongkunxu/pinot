@@ -74,7 +74,8 @@ public class MaterializedViewAnalyzerTest {
 
   @Test
   public void testValidSqlWithMatchingSchema() {
-    String sql = "SELECT city, count(*) AS cnt, sum(amount) AS total_amount FROM orders GROUP BY city";
+    String sql = "SELECT DaysSinceEpoch, city, count(*) AS cnt, sum(amount) AS total_amount "
+        + "FROM orders GROUP BY DaysSinceEpoch, city";
     Schema mvSchema = new Schema.SchemaBuilder()
         .addSingleValueDimension("city", FieldSpec.DataType.STRING)
         .addMetric("cnt", FieldSpec.DataType.LONG)
@@ -93,12 +94,18 @@ public class MaterializedViewAnalyzerTest {
     assertTrue(result.getSelectFields().contains("city"));
     assertTrue(result.getSelectFields().contains("cnt"));
     assertTrue(result.getSelectFields().contains("total_amount"));
-    assertEquals(result.getSelectFields().size(), 3);
+    assertTrue(result.getSelectFields().contains(TIME_COLUMN));
+    assertEquals(result.getSelectFields().size(), 4);
+
+    // Verify partitionExprMaps
+    assertNotNull(result.getPartitionExprMaps());
+    assertEquals(result.getPartitionExprMaps().size(), 1);
+    assertEquals(result.getPartitionExprMaps().get(TIME_COLUMN), TIME_COLUMN);
   }
 
   @Test
   public void testValidSqlBareColumnsOnly() {
-    String sql = "SELECT city, status FROM orders";
+    String sql = "SELECT DaysSinceEpoch, city, status FROM orders";
     Schema mvSchema = new Schema.SchemaBuilder()
         .addSingleValueDimension("city", FieldSpec.DataType.STRING)
         .addSingleValueDimension("status", FieldSpec.DataType.STRING)
@@ -112,7 +119,57 @@ public class MaterializedViewAnalyzerTest {
         MaterializedViewAnalyzer.analyze(sql, mvTableConfig, mvSchema, taskConfigs, _mockAccessor);
 
     assertNotNull(result);
-    assertEquals(result.getSelectFields().size(), 2);
+    assertEquals(result.getSelectFields().size(), 3);
+    assertEquals(result.getPartitionExprMaps().get(TIME_COLUMN), TIME_COLUMN);
+  }
+
+  @Test
+  public void testValidSqlWithTimeTransformFunction() {
+    String sql = "SELECT dateTimeConvert(DaysSinceEpoch, '1:DAYS:EPOCH', '1:DAYS:EPOCH', '7:DAYS') "
+        + "AS weekBucket, city, count(*) AS cnt FROM orders "
+        + "GROUP BY dateTimeConvert(DaysSinceEpoch, '1:DAYS:EPOCH', '1:DAYS:EPOCH', '7:DAYS'), city";
+    Schema mvSchema = new Schema.SchemaBuilder()
+        .addSingleValueDimension("city", FieldSpec.DataType.STRING)
+        .addMetric("cnt", FieldSpec.DataType.LONG)
+        .addDateTime("weekBucket", FieldSpec.DataType.LONG, "1:DAYS:EPOCH", "7:DAYS")
+        .build();
+
+    TableConfig mvTableConfig = buildMvTableConfig();
+    Map<String, String> taskConfigs = buildTaskConfigs(sql);
+
+    MaterializedViewAnalyzer.AnalysisResult result =
+        MaterializedViewAnalyzer.analyze(sql, mvTableConfig, mvSchema, taskConfigs, _mockAccessor);
+
+    assertNotNull(result);
+    assertEquals(result.getPartitionExprMaps().size(), 1);
+    assertEquals(result.getPartitionExprMaps().get(
+        "datetimeconvert(DaysSinceEpoch, '1:DAYS:EPOCH', '1:DAYS:EPOCH', '7:DAYS')"), "weekBucket");
+  }
+
+  @Test
+  public void testTimeColumnMissingFromSelect() {
+    String sql = "SELECT city, count(*) AS cnt FROM orders GROUP BY city";
+    Schema mvSchema = new Schema.SchemaBuilder()
+        .addSingleValueDimension("city", FieldSpec.DataType.STRING)
+        .addMetric("cnt", FieldSpec.DataType.LONG)
+        .addDateTime(TIME_COLUMN, FieldSpec.DataType.LONG, "1:DAYS:EPOCH", "1:DAYS")
+        .build();
+
+    expectError(sql, mvSchema, "is not produced by any SELECT expression");
+  }
+
+  @Test
+  public void testTimeColumnMissingFromGroupBy() {
+    // Calcite enforces that non-aggregated SELECT columns must appear in GROUP BY,
+    // so this SQL fails at syntax validation with Calcite's own error message.
+    String sql = "SELECT DaysSinceEpoch, city, count(*) AS cnt FROM orders GROUP BY city";
+    Schema mvSchema = new Schema.SchemaBuilder()
+        .addSingleValueDimension("city", FieldSpec.DataType.STRING)
+        .addMetric("cnt", FieldSpec.DataType.LONG)
+        .addDateTime(TIME_COLUMN, FieldSpec.DataType.LONG, "1:DAYS:EPOCH", "1:DAYS")
+        .build();
+
+    expectError(sql, mvSchema, "functionally dependent");
   }
 
   // -----------------------------------------------------------------------
@@ -153,7 +210,7 @@ public class MaterializedViewAnalyzerTest {
 
   @Test
   public void testSourceTableNotFound() {
-    String sql = "SELECT city FROM nonexistent_table GROUP BY city";
+    String sql = "SELECT DaysSinceEpoch, city FROM nonexistent_table GROUP BY DaysSinceEpoch, city";
     Schema mvSchema = new Schema.SchemaBuilder()
         .addSingleValueDimension("city", FieldSpec.DataType.STRING)
         .addDateTime(TIME_COLUMN, FieldSpec.DataType.LONG, "1:DAYS:EPOCH", "1:DAYS")
@@ -172,7 +229,7 @@ public class MaterializedViewAnalyzerTest {
         .build();
     when(_mockAccessor.getTableConfig("no_time_table_OFFLINE")).thenReturn(noTimeConfig);
 
-    String sql = "SELECT city FROM no_time_table GROUP BY city";
+    String sql = "SELECT DaysSinceEpoch, city FROM no_time_table GROUP BY DaysSinceEpoch, city";
     Schema mvSchema = new Schema.SchemaBuilder()
         .addSingleValueDimension("city", FieldSpec.DataType.STRING)
         .addDateTime(TIME_COLUMN, FieldSpec.DataType.LONG, "1:DAYS:EPOCH", "1:DAYS")
@@ -193,7 +250,7 @@ public class MaterializedViewAnalyzerTest {
     when(_mockAccessor.getTableConfig("missing_spec_table_OFFLINE")).thenReturn(withTimeConfig);
     when(_mockAccessor.getTableSchema("missing_spec_table_OFFLINE")).thenReturn(schemaWithoutSpec);
 
-    String sql = "SELECT city FROM missing_spec_table GROUP BY city";
+    String sql = "SELECT DaysSinceEpoch, city FROM missing_spec_table GROUP BY DaysSinceEpoch, city";
     Schema mvSchema = new Schema.SchemaBuilder()
         .addSingleValueDimension("city", FieldSpec.DataType.STRING)
         .addDateTime(TIME_COLUMN, FieldSpec.DataType.LONG, "1:DAYS:EPOCH", "1:DAYS")
@@ -204,7 +261,8 @@ public class MaterializedViewAnalyzerTest {
 
   @Test
   public void testSourceColumnNotExist() {
-    String sql = "SELECT city, sum(nonexistent_col) AS total FROM orders GROUP BY city";
+    String sql = "SELECT DaysSinceEpoch, city, sum(nonexistent_col) AS total FROM orders "
+        + "GROUP BY DaysSinceEpoch, city";
     Schema mvSchema = new Schema.SchemaBuilder()
         .addSingleValueDimension("city", FieldSpec.DataType.STRING)
         .addMetric("total", FieldSpec.DataType.DOUBLE)
@@ -220,7 +278,7 @@ public class MaterializedViewAnalyzerTest {
 
   @Test
   public void testMvSchemaColumnNotCoveredBySelect() {
-    String sql = "SELECT city, count(*) AS cnt FROM orders GROUP BY city";
+    String sql = "SELECT DaysSinceEpoch, city, count(*) AS cnt FROM orders GROUP BY DaysSinceEpoch, city";
     Schema mvSchema = new Schema.SchemaBuilder()
         .addSingleValueDimension("city", FieldSpec.DataType.STRING)
         .addMetric("cnt", FieldSpec.DataType.LONG)
@@ -233,7 +291,8 @@ public class MaterializedViewAnalyzerTest {
 
   @Test
   public void testSelectFieldNotInMvSchema() {
-    String sql = "SELECT city, count(*) AS cnt, sum(amount) AS total FROM orders GROUP BY city";
+    String sql = "SELECT DaysSinceEpoch, city, count(*) AS cnt, sum(amount) AS total "
+        + "FROM orders GROUP BY DaysSinceEpoch, city";
     Schema mvSchema = new Schema.SchemaBuilder()
         .addSingleValueDimension("city", FieldSpec.DataType.STRING)
         .addMetric("cnt", FieldSpec.DataType.LONG)
@@ -245,7 +304,7 @@ public class MaterializedViewAnalyzerTest {
 
   @Test
   public void testAggregateWithoutAlias() {
-    String sql = "SELECT city, count(*) FROM orders GROUP BY city";
+    String sql = "SELECT DaysSinceEpoch, city, count(*) FROM orders GROUP BY DaysSinceEpoch, city";
     Schema mvSchema = new Schema.SchemaBuilder()
         .addSingleValueDimension("city", FieldSpec.DataType.STRING)
         .addMetric("cnt", FieldSpec.DataType.LONG)
@@ -261,7 +320,7 @@ public class MaterializedViewAnalyzerTest {
 
   @Test
   public void testNonOfflineTableType() {
-    String sql = "SELECT city, count(*) AS cnt FROM orders GROUP BY city";
+    String sql = "SELECT DaysSinceEpoch, city, count(*) AS cnt FROM orders GROUP BY DaysSinceEpoch, city";
     Schema mvSchema = new Schema.SchemaBuilder()
         .addSingleValueDimension("city", FieldSpec.DataType.STRING)
         .addMetric("cnt", FieldSpec.DataType.LONG)
@@ -284,7 +343,7 @@ public class MaterializedViewAnalyzerTest {
 
   @Test
   public void testInvalidBucketTimePeriod() {
-    String sql = "SELECT city, count(*) AS cnt FROM orders GROUP BY city";
+    String sql = "SELECT DaysSinceEpoch, city, count(*) AS cnt FROM orders GROUP BY DaysSinceEpoch, city";
     Schema mvSchema = new Schema.SchemaBuilder()
         .addSingleValueDimension("city", FieldSpec.DataType.STRING)
         .addMetric("cnt", FieldSpec.DataType.LONG)
@@ -299,7 +358,7 @@ public class MaterializedViewAnalyzerTest {
 
   @Test
   public void testInvalidMaxNumRecordsPerSegment() {
-    String sql = "SELECT city, count(*) AS cnt FROM orders GROUP BY city";
+    String sql = "SELECT DaysSinceEpoch, city, count(*) AS cnt FROM orders GROUP BY DaysSinceEpoch, city";
     Schema mvSchema = new Schema.SchemaBuilder()
         .addSingleValueDimension("city", FieldSpec.DataType.STRING)
         .addMetric("cnt", FieldSpec.DataType.LONG)
@@ -314,7 +373,7 @@ public class MaterializedViewAnalyzerTest {
 
   @Test
   public void testNonNumericMaxNumRecordsPerSegment() {
-    String sql = "SELECT city, count(*) AS cnt FROM orders GROUP BY city";
+    String sql = "SELECT DaysSinceEpoch, city, count(*) AS cnt FROM orders GROUP BY DaysSinceEpoch, city";
     Schema mvSchema = new Schema.SchemaBuilder()
         .addSingleValueDimension("city", FieldSpec.DataType.STRING)
         .addMetric("cnt", FieldSpec.DataType.LONG)
@@ -333,8 +392,8 @@ public class MaterializedViewAnalyzerTest {
 
   @Test
   public void testComplexSqlWithMultipleAggregations() {
-    String sql = "SELECT city, count(*) AS cnt, sum(amount) AS total, min(amount) AS min_amt, "
-        + "max(amount) AS max_amt FROM orders GROUP BY city";
+    String sql = "SELECT DaysSinceEpoch, city, count(*) AS cnt, sum(amount) AS total, "
+        + "min(amount) AS min_amt, max(amount) AS max_amt FROM orders GROUP BY DaysSinceEpoch, city";
     Schema mvSchema = new Schema.SchemaBuilder()
         .addSingleValueDimension("city", FieldSpec.DataType.STRING)
         .addMetric("cnt", FieldSpec.DataType.LONG)
@@ -351,7 +410,7 @@ public class MaterializedViewAnalyzerTest {
         MaterializedViewAnalyzer.analyze(sql, mvTableConfig, mvSchema, taskConfigs, _mockAccessor);
 
     assertNotNull(result);
-    assertEquals(result.getSelectFields().size(), 5);
+    assertEquals(result.getSelectFields().size(), 6);
   }
 
   @Test
@@ -370,7 +429,7 @@ public class MaterializedViewAnalyzerTest {
     when(_mockAccessor.getTableConfig(realtimeTable)).thenReturn(rtConfig);
     when(_mockAccessor.getTableSchema(realtimeTable)).thenReturn(rtSchema);
 
-    String sql = "SELECT city FROM rt_orders";
+    String sql = "SELECT DaysSinceEpoch, city FROM rt_orders";
     Schema mvSchema = new Schema.SchemaBuilder()
         .addSingleValueDimension("city", FieldSpec.DataType.STRING)
         .addDateTime(TIME_COLUMN, FieldSpec.DataType.LONG, "1:DAYS:EPOCH", "1:DAYS")

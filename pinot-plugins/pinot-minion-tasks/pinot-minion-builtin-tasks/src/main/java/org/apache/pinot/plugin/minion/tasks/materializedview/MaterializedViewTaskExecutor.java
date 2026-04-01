@@ -334,6 +334,7 @@ public class MaterializedViewTaskExecutor extends BaseTaskExecutor {
     List<String> baseTables;
     String timeRangeRefTable;
     String definedSql;
+    Map<String, String> partitionExprMaps;
 
     if (existing != null) {
       baseToMv = new HashMap<>(existing.getBaseToMvPartitionMap());
@@ -341,6 +342,7 @@ public class MaterializedViewTaskExecutor extends BaseTaskExecutor {
       baseTables = existing.getBaseTables();
       timeRangeRefTable = existing.getTimeRangeRefTable();
       definedSql = existing.getDefinedSql();
+      partitionExprMaps = existing.getPartitionExprMaps();
       if (definedSql == null) {
         definedSql = configs.get(MaterializedViewTask.ORIGINAL_DEFINED_SQL_KEY);
       }
@@ -350,6 +352,7 @@ public class MaterializedViewTaskExecutor extends BaseTaskExecutor {
       baseTables = Collections.singletonList(sourceTableName);
       timeRangeRefTable = sourceTableName;
       definedSql = configs.get(MaterializedViewTask.ORIGINAL_DEFINED_SQL_KEY);
+      partitionExprMaps = new HashMap<>();
     }
 
     // Merge partition mapping for this window (1:1 mapping for time-window-based MVs)
@@ -357,7 +360,7 @@ public class MaterializedViewTaskExecutor extends BaseTaskExecutor {
     mvToBase.computeIfAbsent(partitionId, k -> new HashSet<>()).add(partitionId);
 
     MaterializedViewMetadata updated = new MaterializedViewMetadata(
-        tableName, baseTables, timeRangeRefTable, definedSql, baseToMv, mvToBase);
+        tableName, baseTables, timeRangeRefTable, definedSql, baseToMv, mvToBase, partitionExprMaps);
     MaterializedViewMetadataUtils.persistMaterializedViewMetadata(
         propertyStore, updated, _mvMetadataExpectedVersion);
 

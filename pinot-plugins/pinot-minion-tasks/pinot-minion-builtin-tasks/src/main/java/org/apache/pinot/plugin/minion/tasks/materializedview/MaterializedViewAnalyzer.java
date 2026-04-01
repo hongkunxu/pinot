@@ -19,6 +19,8 @@
 package org.apache.pinot.plugin.minion.tasks.materializedview;
 
 import com.google.common.base.Preconditions;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -91,10 +93,13 @@ public final class MaterializedViewAnalyzer {
     // Source column existence
     validateSourceColumns(pinotQuery, sourceTableName, clusterInfoAccessor);
 
-    // Step 3: MV schema column completeness
+    // Step 3: MV schema column completeness (including dateTime columns)
     Set<String> selectFields = validateMvColumns(pinotQuery, mvSchema);
 
-    return new AnalysisResult(sourceTableName, selectFields);
+    // Step 5: extract and validate time column transformation mappings
+    Map<String, String> partitionExprMaps = extractPartitionExprMaps(pinotQuery, mvSchema);
+
+    return new AnalysisResult(sourceTableName, selectFields, partitionExprMaps);
   }
 
   /**
@@ -215,11 +220,8 @@ public final class MaterializedViewAnalyzer {
       selectFields.add(fieldName);
     }
 
-    // Build expected MV schema columns (excluding dateTime columns)
+    // All MV schema columns (including dateTime columns) must be covered by SELECT
     Set<String> schemaColumns = new HashSet<>(mvSchema.getColumnNames());
-    for (String dateTimeName : mvSchema.getDateTimeNames()) {
-      schemaColumns.remove(dateTimeName);
-    }
 
     // Check 1: every MV schema column must be covered by a SELECT field
     for (String col : schemaColumns) {
@@ -345,6 +347,85 @@ public final class MaterializedViewAnalyzer {
   }
 
   // ---------------------------------------------------------------------------
+  //  Step 5 — Time column transformation mappings (partitionExprMaps)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Extracts the mapping from base-table time column expressions to MV dateTime column names.
+   *
+   * <p>For each dateTime column in the MV schema, this method finds the corresponding SELECT
+   * expression and records the transformation. The expression is the base-table side (e.g.,
+   * {@code dateTimeConvert(ts, '1:MILLISECONDS:EPOCH', '1:DAYS:EPOCH', '1:DAYS')}) and the
+   * value is the MV column identifier (e.g., {@code mvDay}).
+   *
+   * <p>If the query has a GROUP BY clause, this method also validates that each dateTime
+   * expression appears in the GROUP BY list.
+   *
+   * @return map from expression string to MV column name
+   */
+  static Map<String, String> extractPartitionExprMaps(PinotQuery pinotQuery, Schema mvSchema) {
+    List<String> dateTimeNamesList = mvSchema.getDateTimeNames();
+    if (dateTimeNamesList.isEmpty()) {
+      return Collections.emptyMap();
+    }
+
+    Set<String> dateTimeNames = new HashSet<>(dateTimeNamesList);
+    List<Expression> selectList = pinotQuery.getSelectList();
+    Map<String, String> partitionExprMaps = new HashMap<>();
+
+    for (Expression expr : selectList) {
+      String outputName = extractOutputFieldName(expr);
+      if (!dateTimeNames.contains(outputName)) {
+        continue;
+      }
+      Expression sourceExpr = extractSourceExpression(expr);
+      String exprString = RequestUtils.prettyPrint(sourceExpr);
+      partitionExprMaps.put(exprString, outputName);
+    }
+
+    Preconditions.checkState(partitionExprMaps.size() == dateTimeNames.size(),
+        "Not all MV dateTime columns are covered by SELECT expressions. "
+            + "Expected dateTime columns: %s, found mappings: %s", dateTimeNames, partitionExprMaps);
+
+    // If GROUP BY exists, verify that each dateTime expression is present in GROUP BY
+    List<Expression> groupByList = pinotQuery.getGroupByList();
+    if (groupByList != null && !groupByList.isEmpty()) {
+      Set<String> groupByExprStrings = new HashSet<>();
+      for (Expression gbExpr : groupByList) {
+        groupByExprStrings.add(RequestUtils.prettyPrint(gbExpr));
+      }
+      for (Map.Entry<String, String> entry : partitionExprMaps.entrySet()) {
+        Preconditions.checkState(groupByExprStrings.contains(entry.getKey()),
+            "Time column expression '%s' (mapped to MV column '%s') must appear in GROUP BY "
+                + "when a GROUP BY clause is present. Current GROUP BY: %s",
+            entry.getKey(), entry.getValue(), groupByExprStrings);
+      }
+    }
+
+    return partitionExprMaps;
+  }
+
+  /**
+   * Extracts the source expression from a SELECT item, stripping any AS alias wrapper.
+   */
+  private static Expression extractSourceExpression(Expression expr) {
+    Function func = expr.getFunctionCall();
+    if (func != null && func.getOperator().equals("as")) {
+      return func.getOperands().get(0);
+    }
+    return expr;
+  }
+
+  /**
+   * Convenience overload that parses the SQL and extracts partition expression maps
+   * without running full validation. Used by the task generator during cold-start.
+   */
+  public static Map<String, String> extractPartitionExprMaps(String definedSql, Schema mvSchema) {
+    PinotQuery pinotQuery = validateSqlSyntax(definedSql);
+    return extractPartitionExprMaps(pinotQuery, mvSchema);
+  }
+
+  // ---------------------------------------------------------------------------
   //  Helpers
   // ---------------------------------------------------------------------------
 
@@ -354,7 +435,10 @@ public final class MaterializedViewAnalyzer {
    */
   private static void collectIdentifiers(Expression expr, Set<String> identifiers) {
     if (expr.getType() == ExpressionType.IDENTIFIER) {
-      identifiers.add(expr.getIdentifier().getName());
+      String name = expr.getIdentifier().getName();
+      if (!"*".equals(name)) {
+        identifiers.add(name);
+      }
       return;
     }
     Function func = expr.getFunctionCall();
@@ -380,10 +464,13 @@ public final class MaterializedViewAnalyzer {
   public static class AnalysisResult {
     private final String _sourceTableName;
     private final Set<String> _selectFields;
+    private final Map<String, String> _partitionExprMaps;
 
-    AnalysisResult(String sourceTableName, Set<String> selectFields) {
+    AnalysisResult(String sourceTableName, Set<String> selectFields,
+        Map<String, String> partitionExprMaps) {
       _sourceTableName = sourceTableName;
       _selectFields = selectFields;
+      _partitionExprMaps = partitionExprMaps;
     }
 
     public String getSourceTableName() {
@@ -392,6 +479,10 @@ public final class MaterializedViewAnalyzer {
 
     public Set<String> getSelectFields() {
       return _selectFields;
+    }
+
+    public Map<String, String> getPartitionExprMaps() {
+      return _partitionExprMaps;
     }
   }
 }

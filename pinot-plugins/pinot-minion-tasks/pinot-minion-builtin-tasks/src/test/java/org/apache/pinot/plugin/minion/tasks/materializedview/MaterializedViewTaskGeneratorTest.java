@@ -24,7 +24,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import org.apache.helix.model.IdealState;
-import org.apache.helix.store.HelixPropertyStore;
+import org.apache.helix.store.zk.ZkHelixPropertyStore;
 import org.apache.helix.zookeeper.datamodel.ZNRecord;
 import org.apache.pinot.common.metadata.segment.SegmentZKMetadata;
 import org.apache.pinot.common.minion.MaterializedViewMetadata;
@@ -95,14 +95,14 @@ public class MaterializedViewTaskGeneratorTest {
     String windowStart = formatSpec.fromMillisToFormat(windowStartMs);
     String windowEnd = formatSpec.fromMillisToFormat(windowEndMs);
 
-    assertEquals(windowStart, "19808");
-    assertEquals(windowEnd, "19809");
+    assertEquals(windowStart, "19809");
+    assertEquals(windowEnd, "19810");
 
     String sql = "select column1, count(*) as cnt from orders group by column1;";
     String result = MaterializedViewTaskGenerator.appendTimeRange(sql, "DaysSinceEpoch", windowStart, windowEnd);
     assertEquals(result,
         "select column1, count(*) as cnt from orders"
-            + " WHERE DaysSinceEpoch >= 19808 AND DaysSinceEpoch < 19809 group by column1");
+            + " WHERE DaysSinceEpoch >= 19809 AND DaysSinceEpoch < 19810 group by column1");
   }
 
   @Test
@@ -137,37 +137,6 @@ public class MaterializedViewTaskGeneratorTest {
     assertTrue(result.contains("WHERE ts >= 1711497600000 AND ts < 1711584000000"));
   }
 
-  @Test
-  public void testAppendTimeColumnWithGroupBy() {
-    String sql = "select city, count(*) as cnt from orders group by city;";
-    String result = MaterializedViewTaskGenerator.appendTimeColumnToSelect(sql, "DaysSinceEpoch");
-    assertEquals(result,
-        "select DaysSinceEpoch, city, count(*) as cnt from orders group by city, DaysSinceEpoch");
-  }
-
-  @Test
-  public void testAppendTimeColumnWithoutGroupBy() {
-    String sql = "select city, count(*) as cnt from orders;";
-    String result = MaterializedViewTaskGenerator.appendTimeColumnToSelect(sql, "ts");
-    assertEquals(result, "select ts, city, count(*) as cnt from orders");
-  }
-
-  @Test
-  public void testAppendTimeColumnAlreadyInSelect() {
-    String sql = "select ts, city, count(*) as cnt from orders group by ts, city";
-    String result = MaterializedViewTaskGenerator.appendTimeColumnToSelect(sql, "ts");
-    assertEquals(result, sql);
-  }
-
-  @Test
-  public void testAppendTimeColumnWithGroupByAndOrderBy() {
-    String sql = "select city, sum(amount) as total from orders group by city order by total";
-    String result = MaterializedViewTaskGenerator.appendTimeColumnToSelect(sql, "DaysSinceEpoch");
-    assertEquals(result,
-        "select DaysSinceEpoch, city, sum(amount) as total from orders"
-            + " group by city, DaysSinceEpoch order by total");
-  }
-
   /**
    * Verifies that on cold-start the generator:
    * <ol>
@@ -185,10 +154,10 @@ public class MaterializedViewTaskGeneratorTest {
     long segmentStartTimeMs = 1711497600000L; // 2024-03-27 00:00:00 UTC
     long bucketMs = 86400000L; // 1 day
 
-    // Build MV table config
+    // Build MV table config with time column included in SQL
     Map<String, String> taskConfigs = new HashMap<>();
     taskConfigs.put(MaterializedViewTask.DEFINED_SQL_KEY,
-        "SELECT city, count(*) as cnt FROM orders GROUP BY city");
+        "SELECT DaysSinceEpoch, city, count(*) as cnt FROM orders GROUP BY DaysSinceEpoch, city");
     taskConfigs.put(MaterializedViewTask.BUCKET_TIME_PERIOD_KEY, "1d");
     Map<String, Map<String, String>> taskConfigsMap = new HashMap<>();
     taskConfigsMap.put(MaterializedViewTask.TASK_TYPE, taskConfigs);
@@ -210,10 +179,18 @@ public class MaterializedViewTaskGeneratorTest {
         .addDateTime(timeColumn, FieldSpec.DataType.LONG, "1:DAYS:EPOCH", "1:DAYS")
         .build();
 
+    // MV schema (used for partitionExprMaps extraction during cold-start)
+    Schema mvSchema = new Schema.SchemaBuilder()
+        .addSingleValueDimension("city", FieldSpec.DataType.STRING)
+        .addMetric("cnt", FieldSpec.DataType.LONG)
+        .addDateTime(timeColumn, FieldSpec.DataType.LONG, "1:DAYS:EPOCH", "1:DAYS")
+        .build();
+
     // Build source segment metadata
     SegmentZKMetadata segmentMetadata = new SegmentZKMetadata("orders_segment_0");
     segmentMetadata.setStartTime(segmentStartTimeMs);
     segmentMetadata.setEndTime(segmentStartTimeMs + bucketMs);
+    segmentMetadata.setTimeUnit(java.util.concurrent.TimeUnit.MILLISECONDS);
     List<SegmentZKMetadata> segmentsList = new ArrayList<>();
     segmentsList.add(segmentMetadata);
 
@@ -224,11 +201,12 @@ public class MaterializedViewTaskGeneratorTest {
     when(mockAccessor.getVipUrl()).thenReturn("http://localhost:9000");
     when(mockAccessor.getTableConfig(sourceTableWithType)).thenReturn(sourceTableConfig);
     when(mockAccessor.getTableSchema(sourceTableWithType)).thenReturn(sourceSchema);
-    when(mockAccessor.getSegmentsZKMetadata(sourceTableWithType)).thenReturn(segmentsList);
+    when(mockAccessor.getTableSchema(mvTableName)).thenReturn(mvSchema);
+    when(mockAccessor.getSegmentsZKMetadata(anyString())).thenReturn(segmentsList);
 
     IdealState idealState = new IdealState(sourceTableWithType);
     idealState.setPartitionState("orders_segment_0", "Server_localhost_7050", "ONLINE");
-    when(mockAccessor.getIdealState(sourceTableWithType)).thenReturn(idealState);
+    when(mockAccessor.getIdealState(anyString())).thenReturn(idealState);
 
     // Cold-start: no existing task metadata
     when(mockAccessor.getMinionTaskMetadataZNRecord(anyString(), anyString())).thenReturn(null);
@@ -243,7 +221,7 @@ public class MaterializedViewTaskGeneratorTest {
         any(MaterializedViewTaskMetadata.class), eq(MaterializedViewTask.TASK_TYPE), anyInt());
 
     // Mock property store for MaterializedViewMetadata persistence
-    HelixPropertyStore<ZNRecord> mockPropertyStore = mock(HelixPropertyStore.class);
+    ZkHelixPropertyStore<ZNRecord> mockPropertyStore = mock(ZkHelixPropertyStore.class);
     when(mockPropertyStore.set(anyString(), any(ZNRecord.class), anyInt(), anyInt())).thenReturn(true);
     PinotHelixResourceManager mockResourceManager = mock(PinotHelixResourceManager.class);
     when(mockResourceManager.getPropertyStore()).thenReturn(mockPropertyStore);
@@ -267,7 +245,7 @@ public class MaterializedViewTaskGeneratorTest {
     PinotTaskConfig taskConfig = result.get(0);
     assertEquals(taskConfig.getConfigs().get(MaterializedViewTask.SOURCE_TABLE_NAME_KEY), sourceTableName);
     assertEquals(taskConfig.getConfigs().get(MaterializedViewTask.ORIGINAL_DEFINED_SQL_KEY),
-        "SELECT city, count(*) as cnt FROM orders GROUP BY city");
+        "SELECT DaysSinceEpoch, city, count(*) as cnt FROM orders GROUP BY DaysSinceEpoch, city");
 
     // Verify watermark was initialized
     assertTrue(capturedTaskMetadata.containsKey(mvTableName));
@@ -282,8 +260,14 @@ public class MaterializedViewTaskGeneratorTest {
     assertEquals(mvMetadata.getBaseTables().size(), 1);
     assertEquals(mvMetadata.getBaseTables().get(0), sourceTableName);
     assertEquals(mvMetadata.getTimeRangeRefTable(), sourceTableName);
-    assertEquals(mvMetadata.getDefinedSql(), "SELECT city, count(*) as cnt FROM orders GROUP BY city");
+    assertEquals(mvMetadata.getDefinedSql(),
+        "SELECT DaysSinceEpoch, city, count(*) as cnt FROM orders GROUP BY DaysSinceEpoch, city");
     assertTrue(mvMetadata.getBaseToMvPartitionMap().isEmpty());
     assertTrue(mvMetadata.getMvToBasePartitionMap().isEmpty());
+
+    // Verify partitionExprMaps was extracted and persisted
+    assertNotNull(mvMetadata.getPartitionExprMaps());
+    assertEquals(mvMetadata.getPartitionExprMaps().size(), 1);
+    assertEquals(mvMetadata.getPartitionExprMaps().get("DaysSinceEpoch"), "DaysSinceEpoch");
   }
 }

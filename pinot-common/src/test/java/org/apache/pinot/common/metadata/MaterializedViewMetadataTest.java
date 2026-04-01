@@ -51,10 +51,14 @@ public class MaterializedViewMetadataTest {
     mvToBasePartitionMap.put(1, new HashSet<>(Collections.singletonList(0)));
     mvToBasePartitionMap.put(2, new HashSet<>(Collections.singletonList(1)));
 
-    String definedSql = "SELECT city, count(*) as cnt FROM orders GROUP BY city";
+    String definedSql = "SELECT DaysSinceEpoch, city, count(*) as cnt FROM orders GROUP BY DaysSinceEpoch, city";
+
+    Map<String, String> partitionExprMaps = new HashMap<>();
+    partitionExprMaps.put("DaysSinceEpoch", "DaysSinceEpoch");
 
     MaterializedViewMetadata original = new MaterializedViewMetadata(
-        mvTableName, baseTables, timeRangeRefTable, definedSql, baseToMvPartitionMap, mvToBasePartitionMap);
+        mvTableName, baseTables, timeRangeRefTable, definedSql,
+        baseToMvPartitionMap, mvToBasePartitionMap, partitionExprMaps);
 
     ZNRecord znRecord = original.toZNRecord();
     assertEquals(znRecord.getId(), mvTableName);
@@ -71,6 +75,34 @@ public class MaterializedViewMetadataTest {
 
     assertEquals(restored.getMvToBasePartitionMap().get(0), new HashSet<>(Collections.singletonList(0)));
     assertEquals(restored.getMvToBasePartitionMap().get(2), new HashSet<>(Collections.singletonList(1)));
+
+    // Verify partitionExprMaps
+    assertEquals(restored.getPartitionExprMaps().size(), 1);
+    assertEquals(restored.getPartitionExprMaps().get("DaysSinceEpoch"), "DaysSinceEpoch");
+  }
+
+  @Test
+  public void testZNRecordRoundTripWithTimeTransform() {
+    String mvTableName = "mv_hourly_OFFLINE";
+
+    Map<String, String> partitionExprMaps = new HashMap<>();
+    partitionExprMaps.put("dateTimeConvert(ts, '1:MILLISECONDS:EPOCH', '1:HOURS:EPOCH', '1:HOURS')", "hourBucket");
+
+    MaterializedViewMetadata original = new MaterializedViewMetadata(
+        mvTableName,
+        Collections.singletonList("events"),
+        "events",
+        "SELECT dateTimeConvert(ts, '1:MILLISECONDS:EPOCH', '1:HOURS:EPOCH', '1:HOURS') AS hourBucket, "
+            + "count(*) AS cnt FROM events GROUP BY dateTimeConvert(ts, '1:MILLISECONDS:EPOCH', "
+            + "'1:HOURS:EPOCH', '1:HOURS')",
+        Collections.emptyMap(), Collections.emptyMap(), partitionExprMaps);
+
+    ZNRecord znRecord = original.toZNRecord();
+    MaterializedViewMetadata restored = MaterializedViewMetadata.fromZNRecord(znRecord);
+
+    assertEquals(restored.getPartitionExprMaps().size(), 1);
+    assertEquals(restored.getPartitionExprMaps().get(
+        "dateTimeConvert(ts, '1:MILLISECONDS:EPOCH', '1:HOURS:EPOCH', '1:HOURS')"), "hourBucket");
   }
 
   @Test
@@ -80,6 +112,7 @@ public class MaterializedViewMetadataTest {
         Collections.singletonList("src_OFFLINE"),
         "src_OFFLINE",
         null,
+        Collections.emptyMap(),
         Collections.emptyMap(),
         Collections.emptyMap()
     );
@@ -92,5 +125,16 @@ public class MaterializedViewMetadataTest {
     assertEquals(restored.getDefinedSql(), null);
     assertTrue(restored.getBaseToMvPartitionMap().isEmpty());
     assertTrue(restored.getMvToBasePartitionMap().isEmpty());
+    assertTrue(restored.getPartitionExprMaps().isEmpty());
+  }
+
+  @Test
+  public void testBackwardCompatibilityNoPartitionExprMaps() {
+    ZNRecord znRecord = new ZNRecord("mv_old_OFFLINE");
+    znRecord.setSimpleField("baseTables", "[\"src_OFFLINE\"]");
+    znRecord.setSimpleField("timeRangeRefTable", "src_OFFLINE");
+
+    MaterializedViewMetadata restored = MaterializedViewMetadata.fromZNRecord(znRecord);
+    assertTrue(restored.getPartitionExprMaps().isEmpty());
   }
 }

@@ -133,13 +133,13 @@ public class MaterializedViewTaskGenerator extends BaseTaskGenerator {
         continue;
       }
 
-      // Resolve source time column, add it to SELECT/GROUP BY, and append time-range filter
+      // Resolve source time column and append time-range WHERE filter.
+      // The time column transformation is already expressed in the user-defined SQL SELECT/GROUP BY.
       String sourceTimeColumn = resolveSourceTimeColumn(sourceTableName);
-      String sqlWithTimeColumn = appendTimeColumnToSelect(definedSQL, sourceTimeColumn);
       DateTimeFormatSpec timeFormatSpec = resolveSourceTimeFormatSpec(sourceTableName, sourceTimeColumn);
       String windowStart = timeFormatSpec.fromMillisToFormat(windowStartMs);
       String windowEnd = timeFormatSpec.fromMillisToFormat(windowEndMs);
-      String sqlWithTimeRange = appendTimeRange(sqlWithTimeColumn, sourceTimeColumn, windowStart, windowEnd);
+      String sqlWithTimeRange = appendTimeRange(definedSQL, sourceTimeColumn, windowStart, windowEnd);
 
       // Build task config
       Map<String, String> configs = new HashMap<>();
@@ -205,71 +205,6 @@ public class MaterializedViewTaskGenerator extends BaseTaskGenerator {
     Preconditions.checkState(fieldSpec != null,
         "No DateTimeFieldSpec found for time column '%s' in source table: %s", timeColumn, rawSourceTableName);
     return fieldSpec.getFormatSpec();
-  }
-
-  /**
-   * Injects the time column into the SQL SELECT list and, if a GROUP BY clause is present,
-   * appends it there too. If the time column already appears in the SELECT list (case-insensitive),
-   * the SQL is returned unchanged.
-   *
-   * <p>Example: given {@code SELECT city, count(*) as cnt FROM orders GROUP BY city} and
-   * time column {@code DaysSinceEpoch}, produces
-   * {@code SELECT DaysSinceEpoch, city, count(*) as cnt FROM orders GROUP BY city, DaysSinceEpoch}.
-   */
-  static String appendTimeColumnToSelect(String sql, String timeColumn) {
-    String trimmed = sql.trim();
-    if (trimmed.endsWith(";")) {
-      trimmed = trimmed.substring(0, trimmed.length() - 1).trim();
-    }
-
-    String upperSql = trimmed.toUpperCase();
-    String upperTimeCol = timeColumn.toUpperCase();
-
-    // Check if the time column already exists in the SELECT list
-    int selectIdx = upperSql.indexOf("SELECT ");
-    Preconditions.checkState(selectIdx >= 0, "No SELECT keyword in SQL: %s", sql);
-    int fromIdx = upperSql.indexOf(" FROM ");
-    Preconditions.checkState(fromIdx > selectIdx, "No FROM keyword in SQL: %s", sql);
-
-    String selectPart = upperSql.substring(selectIdx + 7, fromIdx);
-    String[] selectItems = selectPart.split(",");
-    for (String item : selectItems) {
-      if (item.trim().equals(upperTimeCol)) {
-        return trimmed;
-      }
-    }
-
-    // Insert time column right after "SELECT "
-    int insertAfterSelect = selectIdx + 7;
-    String result = trimmed.substring(0, insertAfterSelect) + timeColumn + ", "
-        + trimmed.substring(insertAfterSelect);
-
-    // If GROUP BY exists, append time column to it
-    String upperResult = result.toUpperCase();
-    int groupByIdx = upperResult.indexOf(" GROUP BY ");
-    if (groupByIdx >= 0) {
-      int groupByContentStart = groupByIdx + 10;
-      int groupByEnd = findClauseEndAfterGroupBy(upperResult, groupByContentStart);
-      result = result.substring(0, groupByEnd) + ", " + timeColumn + result.substring(groupByEnd);
-    }
-
-    return result;
-  }
-
-  /**
-   * Finds the end of the GROUP BY column list, i.e. the position of the next major clause
-   * keyword (ORDER, HAVING, LIMIT) or the end of the string.
-   */
-  private static int findClauseEndAfterGroupBy(String upperSql, int fromIdx) {
-    String[] keywords = {" ORDER ", " HAVING ", " LIMIT "};
-    int minIdx = upperSql.length();
-    for (String keyword : keywords) {
-      int idx = upperSql.indexOf(keyword, fromIdx);
-      if (idx >= 0 && idx < minIdx) {
-        minIdx = idx;
-      }
-    }
-    return minIdx;
   }
 
   /**
@@ -349,13 +284,20 @@ public class MaterializedViewTaskGenerator extends BaseTaskGenerator {
       LOGGER.info("Cold-start: initialized watermark to {} for MV table: {} from source table: {}",
           watermarkMs, mvTableName, sourceTableName);
 
-      // Initialize MaterializedViewMetadata with base table info and empty partition maps
+      // Extract time column transformation mappings from the SQL
+      String mvTableWithType = TableNameBuilder.OFFLINE.tableNameWithType(mvTableName);
+      Schema mvSchema = _clusterInfoAccessor.getTableSchema(mvTableWithType);
+      Map<String, String> partitionExprMaps = (mvSchema != null)
+          ? MaterializedViewAnalyzer.extractPartitionExprMaps(definedSQL, mvSchema)
+          : new HashMap<>();
+
+      // Initialize MaterializedViewMetadata with base table info and partition expression maps
       MaterializedViewMetadata mvMetadata = new MaterializedViewMetadata(
           mvTableName,
           Collections.singletonList(sourceTableName),
           sourceTableName,
           definedSQL,
-          new HashMap<>(), new HashMap<>());
+          new HashMap<>(), new HashMap<>(), partitionExprMaps);
       MaterializedViewMetadataUtils.persistMaterializedViewMetadata(
           _clusterInfoAccessor.getPinotHelixResourceManager().getPropertyStore(), mvMetadata, -1);
       LOGGER.info("Cold-start: initialized MaterializedViewMetadata for MV table: {} with source table: {}",

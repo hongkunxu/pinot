@@ -206,6 +206,6 @@ public class GrpcMvQueryExecutorTest {
     when(_helixManager.getHelixDataAccessor()).thenReturn(accessor);
     when(accessor.keyBuilder()).thenReturn(keyBuilder);
     when(keyBuilder.instanceConfigs()).thenReturn(propertyKey);
-    when(accessor.getChildValues(propertyKey, true)).thenReturn(configs);
+    when(accessor.getChildValues(propertyKey, true)).thenReturn(new ArrayList<>(configs));
   }
 }

@@ -32,7 +32,8 @@ import org.apache.pinot.spi.utils.JsonUtils;
 
 /**
  * Stores the relationship between a materialized-view (MV) table and its base tables, including
- * partition mappings that support N:M partition propagation.
+ * partition mappings that support N:M partition propagation and expression-level time column
+ * transformation mappings.
  *
  * <p>Persisted in ZooKeeper under
  * {@code /CONFIGS/MATERIALIZED_VIEW/<mvTableNameWithType>} as a {@link ZNRecord}.
@@ -44,6 +45,8 @@ import org.apache.pinot.spi.utils.JsonUtils;
  *   <li>{@code definedSql} – the user-defined SQL query that produces the MV</li>
  *   <li>{@code baseToMvPartitionMap} – JSON map: basePartitionId -&gt; set of mvPartitionIds</li>
  *   <li>{@code mvToBasePartitionMap} – JSON map: mvPartitionId -&gt; set of basePartitionIds</li>
+ *   <li>{@code partitionExprMaps} – JSON map: base-table expression string -&gt; MV column name,
+ *       recording how base table time columns are transformed into MV time columns</li>
  * </ul>
  *
  * <p>Thread-safety: instances are effectively immutable after construction.
@@ -55,11 +58,14 @@ public class MaterializedViewMetadata {
   private static final String DEFINED_SQL_KEY = "definedSql";
   private static final String BASE_TO_MV_PARTITION_MAP_KEY = "baseToMvPartitionMap";
   private static final String MV_TO_BASE_PARTITION_MAP_KEY = "mvToBasePartitionMap";
+  private static final String PARTITION_EXPR_MAPS_KEY = "partitionExprMaps";
 
   private static final TypeReference<List<String>> STRING_LIST_TYPE =
       new TypeReference<List<String>>() { };
   private static final TypeReference<Map<Integer, Set<Integer>>> PARTITION_MAP_TYPE =
       new TypeReference<Map<Integer, Set<Integer>>>() { };
+  private static final TypeReference<Map<String, String>> STRING_MAP_TYPE =
+      new TypeReference<Map<String, String>>() { };
 
   private final String _mvTableNameWithType;
 
@@ -76,16 +82,24 @@ public class MaterializedViewMetadata {
   private final Map<Integer, Set<Integer>> _baseToMvPartitionMap;
   private final Map<Integer, Set<Integer>> _mvToBasePartitionMap;
 
+  /// Maps base-table expression strings to MV column identifiers, recording how each base
+  /// table time column expression is transformed into the corresponding MV time column.
+  /// For example: {@code {"dateTimeConvert(ts,'1:MILLISECONDS:EPOCH','1:DAYS:EPOCH','1:DAYS')": "mvDay"}}
+  /// or for a simple pass-through: {@code {"ts": "ts"}}.
+  private final Map<String, String> _partitionExprMaps;
+
   public MaterializedViewMetadata(String mvTableNameWithType, List<String> baseTables,
       String timeRangeRefTable, String definedSql,
       Map<Integer, Set<Integer>> baseToMvPartitionMap,
-      Map<Integer, Set<Integer>> mvToBasePartitionMap) {
+      Map<Integer, Set<Integer>> mvToBasePartitionMap,
+      Map<String, String> partitionExprMaps) {
     _mvTableNameWithType = mvTableNameWithType;
     _baseTables = baseTables;
     _timeRangeRefTable = timeRangeRefTable;
     _definedSql = definedSql;
     _baseToMvPartitionMap = baseToMvPartitionMap;
     _mvToBasePartitionMap = mvToBasePartitionMap;
+    _partitionExprMaps = partitionExprMaps;
   }
 
   public String getMvTableNameWithType() {
@@ -112,6 +126,10 @@ public class MaterializedViewMetadata {
     return _mvToBasePartitionMap;
   }
 
+  public Map<String, String> getPartitionExprMaps() {
+    return _partitionExprMaps;
+  }
+
   public ZNRecord toZNRecord() {
     ZNRecord znRecord = new ZNRecord(_mvTableNameWithType);
     try {
@@ -128,6 +146,10 @@ public class MaterializedViewMetadata {
       if (!_mvToBasePartitionMap.isEmpty()) {
         znRecord.setSimpleField(MV_TO_BASE_PARTITION_MAP_KEY,
             JsonUtils.objectToString(_mvToBasePartitionMap));
+      }
+      if (_partitionExprMaps != null && !_partitionExprMaps.isEmpty()) {
+        znRecord.setSimpleField(PARTITION_EXPR_MAPS_KEY,
+            JsonUtils.objectToString(_partitionExprMaps));
       }
     } catch (JsonProcessingException e) {
       throw new IllegalStateException("Failed to serialize MaterializedViewMetadata", e);
@@ -156,8 +178,13 @@ public class MaterializedViewMetadata {
           ? JsonUtils.stringToObject(mvToBaseJson, PARTITION_MAP_TYPE)
           : new HashMap<>();
 
+      String partitionExprMapsJson = znRecord.getSimpleField(PARTITION_EXPR_MAPS_KEY);
+      Map<String, String> partitionExprMaps = partitionExprMapsJson != null
+          ? JsonUtils.stringToObject(partitionExprMapsJson, STRING_MAP_TYPE)
+          : new HashMap<>();
+
       return new MaterializedViewMetadata(mvTableNameWithType, baseTables, timeRangeRefTable,
-          definedSql, baseToMvPartitionMap, mvToBasePartitionMap);
+          definedSql, baseToMvPartitionMap, mvToBasePartitionMap, partitionExprMaps);
     } catch (IOException e) {
       throw new IllegalStateException("Failed to deserialize MaterializedViewMetadata from ZNRecord", e);
     }
