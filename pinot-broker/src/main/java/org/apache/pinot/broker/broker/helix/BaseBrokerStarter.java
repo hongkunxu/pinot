@@ -46,6 +46,11 @@ import org.apache.helix.zookeeper.datamodel.ZNRecord;
 import org.apache.pinot.broker.broker.AccessControlFactory;
 import org.apache.pinot.broker.broker.BrokerAdminApiApplication;
 import org.apache.pinot.broker.grpc.BrokerGrpcServer;
+import org.apache.pinot.broker.materializedview.MvMetadataCache;
+import org.apache.pinot.broker.materializedview.MvQueryRewriteEngine;
+import org.apache.pinot.broker.materializedview.rewriter.AggSubsumptionStrategy;
+import org.apache.pinot.broker.materializedview.rewriter.ExactSubsumptionStrategy;
+import org.apache.pinot.broker.materializedview.rewriter.ScanSubsumptionStrategy;
 import org.apache.pinot.broker.queryquota.HelixExternalViewBasedQueryQuotaManager;
 import org.apache.pinot.broker.requesthandler.BaseSingleStageBrokerRequestHandler;
 import org.apache.pinot.broker.requesthandler.BrokerRequestHandler;
@@ -443,6 +448,15 @@ public abstract class BaseBrokerStarter implements ServiceStartable {
               _accessControlFactory, _queryQuotaManager, _tableCache, nettyDefaults, tlsDefaults,
               _serverRoutingStatsManager, _failureDetector, _threadAccountant, multiClusterRoutingContext);
     }
+    LOGGER.info("Initializing MV metadata cache and query rewrite engine");
+    MvMetadataCache mvMetadataCache = new MvMetadataCache(_propertyStore);
+    MvQueryRewriteEngine mvQueryRewriteEngine =
+        new MvQueryRewriteEngine(mvMetadataCache, List.of(
+            new ExactSubsumptionStrategy(),
+            new ScanSubsumptionStrategy(),
+            new AggSubsumptionStrategy()));
+    singleStageBrokerRequestHandler.setMvQueryRewriteEngine(mvQueryRewriteEngine);
+
     MultiStageBrokerRequestHandler multiStageBrokerRequestHandler = null;
     if (_brokerConf.getProperty(Helix.CONFIG_OF_MULTI_STAGE_ENGINE_ENABLED, Helix.DEFAULT_MULTI_STAGE_ENGINE_ENABLED)) {
       _multiStageQueryThrottler = new MultiStageQueryThrottler(_brokerConf);

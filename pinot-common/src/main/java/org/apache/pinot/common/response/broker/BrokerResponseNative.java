@@ -45,7 +45,8 @@ import org.apache.pinot.spi.utils.JsonUtils;
 @JsonPropertyOrder({
     "resultTable", "numRowsResultSet", "partialResult", "exceptions", "numGroupsLimitReached",
     "numGroupsWarningLimitReached", "timeUsedMs", "requestId", "clientRequestId", "brokerId", "numDocsScanned",
-    "totalDocs", "numEntriesScannedInFilter", "numEntriesScannedPostFilter", "numServersQueried", "numServersResponded",
+    "totalDocs", "candidateMvs", "hitMv",
+    "numEntriesScannedInFilter", "numEntriesScannedPostFilter", "numServersQueried", "numServersResponded",
     "numSegmentsQueried", "numSegmentsProcessed", "numSegmentsMatched", "numConsumingSegmentsQueried",
     "numConsumingSegmentsProcessed", "numConsumingSegmentsMatched", "minConsumingFreshnessTimeMs",
     "numSegmentsPrunedByBroker", "numSegmentsPrunedByServer", "numSegmentsPrunedInvalid", "numSegmentsPrunedByLimit",
@@ -116,6 +117,13 @@ public class BrokerResponseNative implements BrokerResponse {
 
   private Set<Integer> _pools = Set.of();
   private boolean _rlsFiltersApplied = false;
+
+  @JsonInclude(JsonInclude.Include.NON_EMPTY)
+  private List<String> _candidateMvs = List.of();
+
+  @JsonInclude(JsonInclude.Include.NON_NULL)
+  @Nullable
+  private String _hitMv;
 
   public BrokerResponseNative() {
   }
@@ -600,5 +608,26 @@ public class BrokerResponseNative implements BrokerResponse {
   @Override
   public boolean getRLSFiltersApplied() {
     return _rlsFiltersApplied;
+  }
+
+  @Override
+  public void setCandidateMvs(List<String> candidateMvs) {
+    _candidateMvs = candidateMvs;
+  }
+
+  @Override
+  public List<String> getCandidateMvs() {
+    return _candidateMvs;
+  }
+
+  @Override
+  public void setHitMv(@Nullable String hitMv) {
+    _hitMv = hitMv;
+  }
+
+  @Nullable
+  @Override
+  public String getHitMv() {
+    return _hitMv;
   }
 }

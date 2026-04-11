@@ -54,6 +54,9 @@ import org.apache.hc.client5.http.io.HttpClientConnectionManager;
 import org.apache.hc.core5.http.io.entity.EntityUtils;
 import org.apache.pinot.broker.api.AccessControl;
 import org.apache.pinot.broker.broker.AccessControlFactory;
+import org.apache.pinot.broker.materializedview.MvMatchResult;
+import org.apache.pinot.broker.materializedview.MvQueryRewriteEngine;
+import org.apache.pinot.broker.materializedview.MvRewriteResult;
 import org.apache.pinot.broker.querylog.QueryLogger;
 import org.apache.pinot.broker.queryquota.QueryQuotaManager;
 import org.apache.pinot.common.config.provider.TableCache;
@@ -164,6 +167,8 @@ public abstract class BaseSingleStageBrokerRequestHandler extends BaseBrokerRequ
   );
 
   protected final QueryOptimizer _queryOptimizer = new QueryOptimizer();
+  @Nullable
+  protected MvQueryRewriteEngine _mvQueryRewriteEngine;
   protected final boolean _disableGroovy;
   protected final boolean _useApproximateFunction;
   protected final int _defaultHllLog2m;
@@ -225,6 +230,14 @@ public abstract class BaseSingleStageBrokerRequestHandler extends BaseBrokerRequ
             + "enabled: {}", getClass().getSimpleName(), _brokerId, _brokerTimeoutMs, _queryResponseLimit,
         _defaultQueryLimit, _queryLogger.getMaxQueryLengthToLog(), _queryLogger.getLogRateLimit(),
         _enableQueryCancellation);
+  }
+
+  /**
+   * Sets the MV query rewrite engine. Called by the broker starter after construction
+   * so that the rewrite engine can be shared across handler instances.
+   */
+  public void setMvQueryRewriteEngine(@Nullable MvQueryRewriteEngine mvQueryRewriteEngine) {
+    _mvQueryRewriteEngine = mvQueryRewriteEngine;
   }
 
   @Override
@@ -384,15 +397,18 @@ public abstract class BaseSingleStageBrokerRequestHandler extends BaseBrokerRequ
     final String _tableName;
     final String _rawTableName;
     final BrokerResponse _errorOrLiteralOnlyBrokerResponse;
+    @Nullable
+    final MvRewriteResult _mvRewriteResult;
 
     public CompileResult(PinotQuery pinotQuery, PinotQuery serverPinotQuery, Schema schema, String tableName,
-        String rawTableName) {
+        String rawTableName, @Nullable MvRewriteResult mvRewriteResult) {
       _pinotQuery = pinotQuery;
       _serverPinotQuery = serverPinotQuery;
       _schema = schema;
       _tableName = tableName;
       _rawTableName = rawTableName;
       _errorOrLiteralOnlyBrokerResponse = null;
+      _mvRewriteResult = mvRewriteResult;
     }
 
     public CompileResult(BrokerResponse errorOrLiteralOnlyBrokerResponse) {
@@ -402,6 +418,7 @@ public abstract class BaseSingleStageBrokerRequestHandler extends BaseBrokerRequ
       _tableName = null;
       _rawTableName = null;
       _errorOrLiteralOnlyBrokerResponse = errorOrLiteralOnlyBrokerResponse;
+      _mvRewriteResult = null;
     }
   }
 
@@ -857,6 +874,11 @@ public abstract class BaseSingleStageBrokerRequestHandler extends BaseBrokerRequ
           remainingTimeMs, serverStats, requestContext);
     }
     brokerResponse.setTablesQueried(Set.of(rawTableName));
+    MvRewriteResult mvRewriteResult = compileResult._mvRewriteResult;
+    if (mvRewriteResult != null) {
+      brokerResponse.setCandidateMvs(mvRewriteResult.getCandidateNames());
+      brokerResponse.setHitMv(mvRewriteResult.getHitMvName());
+    }
     brokerResponse.setPools(Stream.concat(
             offlineExecutionServers != null ? offlineExecutionServers.stream() : Stream.empty(),
             realtimeExecutionServers != null ? realtimeExecutionServers.stream() : Stream.empty())
@@ -1075,9 +1097,27 @@ public abstract class BaseSingleStageBrokerRequestHandler extends BaseBrokerRequ
     if (schema != null) {
       handleAggFunctionMVOverride(serverPinotQuery, schema);
     }
+
+    MvRewriteResult mvRewriteResult = null;
+    if (_mvQueryRewriteEngine != null
+        && QueryOptionsUtils.isUseMaterializedView(serverPinotQuery.getQueryOptions())) {
+      mvRewriteResult = _mvQueryRewriteEngine.tryRewrite(serverPinotQuery, rawTableName);
+      if (mvRewriteResult != null && mvRewriteResult.isHit()) {
+        MvMatchResult mvMatchResult = mvRewriteResult.getMatchResult();
+        serverPinotQuery = mvMatchResult.getRewrittenQuery();
+        // Keep pinotQuery in sync with serverPinotQuery so that the reduce phase does not
+        // treat the MV-rewritten query as a nested/gapfill query and fail with
+        // "Nested query is not supported without gapfill".
+        pinotQuery = serverPinotQuery;
+        tableName = mvMatchResult.getMvTableName();
+        rawTableName = TableNameBuilder.extractRawTableName(tableName);
+        schema = _tableCache.getSchema(rawTableName);
+      }
+    }
+
     _queryOptimizer.optimize(serverPinotQuery, schema);
 
-    return new CompileResult(pinotQuery, serverPinotQuery, schema, tableName, rawTableName);
+    return new CompileResult(pinotQuery, serverPinotQuery, schema, tableName, rawTableName, mvRewriteResult);
   }
 
   private void throwAccessDeniedError(long requestId, String query, RequestContext requestContext, String tableName,

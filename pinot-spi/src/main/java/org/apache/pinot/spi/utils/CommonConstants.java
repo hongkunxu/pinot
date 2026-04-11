@@ -710,6 +710,7 @@ public class CommonConstants {
         public static final String USE_FIXED_REPLICA = "useFixedReplica";
         public static final String EXPLAIN_PLAN_VERBOSE = "explainPlanVerbose";
         public static final String USE_MULTISTAGE_ENGINE = "useMultistageEngine";
+        public static final String USE_MATERIALIZED_VIEW = "useMaterializedView";
         public static final String INFER_PARTITION_HINT = "inferPartitionHint";
         public static final String ENABLE_NULL_HANDLING = "enableNullHandling";
         public static final String APPLICATION_NAME = "applicationName";
