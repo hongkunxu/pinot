@@ -256,6 +256,85 @@ public final class MvMatchUtils {
   }
 
   // -----------------------------------------------------------------------
+  //  Expression remapping
+  // -----------------------------------------------------------------------
+
+  /**
+   * Recursively rewrites an expression tree by replacing any sub-expression
+   * found in {@code mvProjectionMap} with a simple identifier referencing the
+   * corresponding MV column name.
+   *
+   * <p>This is used to transform HAVING, ORDER BY, and residual WHERE
+   * expressions from base-table semantics to MV-table semantics. For example,
+   * {@code SUM(revenue) > 1000} becomes {@code sum_rev > 1000} when the
+   * projection map contains {@code SUM(revenue) -> "sum_rev"}.
+   *
+   * @param expr            the expression to remap
+   * @param mvProjectionMap alias-stripped expression &rarr; MV column name
+   * @return the remapped expression (may be the same instance if nothing changed)
+   */
+  public static Expression remapExpression(Expression expr, Map<Expression, String> mvProjectionMap) {
+    if (mvProjectionMap.containsKey(expr)) {
+      return RequestUtils.getIdentifierExpression(mvProjectionMap.get(expr));
+    }
+
+    if (expr.getType() == ExpressionType.FUNCTION) {
+      Function func = expr.getFunctionCall();
+      if (func != null && func.getOperands() != null) {
+        List<Expression> originalOperands = func.getOperands();
+        List<Expression> remapped = new ArrayList<>(originalOperands.size());
+        boolean changed = false;
+        for (Expression operand : originalOperands) {
+          Expression result = remapExpression(operand, mvProjectionMap);
+          remapped.add(result);
+          if (result != operand) {
+            changed = true;
+          }
+        }
+        if (changed) {
+          return RequestUtils.getFunctionExpression(func.getOperator(), remapped);
+        }
+      }
+    }
+
+    return expr;
+  }
+
+  /**
+   * Checks whether all non-literal leaf sub-expressions within {@code expr}
+   * can be resolved via the given projection map. Identifiers and aggregation
+   * functions must appear as keys; literals and comparison/logical operators
+   * are traversed transparently.
+   *
+   * @param expr            the expression to validate
+   * @param mvProjectionMap alias-stripped expression &rarr; MV column name
+   * @return {@code true} if every resolvable leaf is present in the map
+   */
+  public static boolean allReferencesResolvable(Expression expr, Map<Expression, String> mvProjectionMap) {
+    if (mvProjectionMap.containsKey(expr)) {
+      return true;
+    }
+    if (expr.getType() == ExpressionType.LITERAL) {
+      return true;
+    }
+    if (expr.getType() == ExpressionType.IDENTIFIER) {
+      return false;
+    }
+    if (expr.getType() == ExpressionType.FUNCTION) {
+      Function func = expr.getFunctionCall();
+      if (func != null && func.getOperands() != null) {
+        for (Expression operand : func.getOperands()) {
+          if (!allReferencesResolvable(operand, mvProjectionMap)) {
+            return false;
+          }
+        }
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // -----------------------------------------------------------------------
   //  Column reference collection
   // -----------------------------------------------------------------------
 

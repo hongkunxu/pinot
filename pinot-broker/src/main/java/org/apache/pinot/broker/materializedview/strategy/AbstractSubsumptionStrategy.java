@@ -16,7 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-package org.apache.pinot.broker.materializedview.rewriter;
+package org.apache.pinot.broker.materializedview.strategy;
 
 import java.util.List;
 import java.util.Map;
@@ -57,7 +57,7 @@ import org.apache.pinot.common.request.PinotQuery;
  *
  * @see ExactSubsumptionStrategy
  * @see ScanSubsumptionStrategy
- * @see AggSubsumptionStrategy
+ * @see AggregationSubsumptionStrategy
  */
 public abstract class AbstractSubsumptionStrategy implements MvMatchStrategy {
 

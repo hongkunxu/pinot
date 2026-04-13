@@ -20,7 +20,7 @@ package org.apache.pinot.broker.materializedview;
 
 import java.util.HashMap;
 import java.util.List;
-import org.apache.pinot.broker.materializedview.rewriter.ScanSubsumptionStrategy;
+import org.apache.pinot.broker.materializedview.strategy.ScanSubsumptionStrategy;
 import org.apache.pinot.common.minion.MaterializedViewMetadata;
 import org.apache.pinot.common.request.PinotQuery;
 import org.apache.pinot.sql.parsers.CalciteSqlParser;

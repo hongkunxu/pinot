@@ -48,9 +48,9 @@ import org.apache.pinot.broker.broker.BrokerAdminApiApplication;
 import org.apache.pinot.broker.grpc.BrokerGrpcServer;
 import org.apache.pinot.broker.materializedview.MvMetadataCache;
 import org.apache.pinot.broker.materializedview.MvQueryRewriteEngine;
-import org.apache.pinot.broker.materializedview.rewriter.AggSubsumptionStrategy;
-import org.apache.pinot.broker.materializedview.rewriter.ExactSubsumptionStrategy;
-import org.apache.pinot.broker.materializedview.rewriter.ScanSubsumptionStrategy;
+import org.apache.pinot.broker.materializedview.strategy.AggregationSubsumptionStrategy;
+import org.apache.pinot.broker.materializedview.strategy.ExactSubsumptionStrategy;
+import org.apache.pinot.broker.materializedview.strategy.ScanSubsumptionStrategy;
 import org.apache.pinot.broker.queryquota.HelixExternalViewBasedQueryQuotaManager;
 import org.apache.pinot.broker.requesthandler.BaseSingleStageBrokerRequestHandler;
 import org.apache.pinot.broker.requesthandler.BrokerRequestHandler;
@@ -454,7 +454,7 @@ public abstract class BaseBrokerStarter implements ServiceStartable {
         new MvQueryRewriteEngine(mvMetadataCache, List.of(
             new ExactSubsumptionStrategy(),
             new ScanSubsumptionStrategy(),
-            new AggSubsumptionStrategy()));
+            new AggregationSubsumptionStrategy()));
     singleStageBrokerRequestHandler.setMvQueryRewriteEngine(mvQueryRewriteEngine);
 
     MultiStageBrokerRequestHandler multiStageBrokerRequestHandler = null;

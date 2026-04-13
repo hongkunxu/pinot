@@ -398,7 +398,7 @@ const extractQueryStatsFromResponse = (queryResponse) => {
     columns: QUERY_STATS_COLUMNS,
     records: [[queryResponse.timeUsedMs, queryResponse.numDocsScanned, queryResponse.totalDocs,
       queryResponse.candidateMvs ? queryResponse.candidateMvs.join(', ') : '-',
-      queryResponse.hitMv ?? '',
+      queryResponse.hitMv ?? '-',
       queryResponse.numServersQueried, queryResponse.numServersResponded,
       queryResponse.numSegmentsQueried, queryResponse.numSegmentsProcessed, queryResponse.numSegmentsMatched, queryResponse.numConsumingSegmentsQueried,
       queryResponse.numEntriesScannedInFilter, queryResponse.numEntriesScannedPostFilter, queryResponse.numGroupsLimitReached, queryResponse.numGroupsWarningLimitReached,

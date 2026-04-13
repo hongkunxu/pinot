@@ -21,7 +21,7 @@ package org.apache.pinot.broker.materializedview;
 import java.util.ArrayList;
 import java.util.List;
 import javax.annotation.Nullable;
-import org.apache.pinot.broker.materializedview.rewriter.MvMatchStrategy;
+import org.apache.pinot.broker.materializedview.strategy.MvMatchStrategy;
 import org.apache.pinot.common.request.PinotQuery;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -39,7 +39,7 @@ import org.slf4j.LoggerFactory;
  *
  * <p>Strategies must be registered in descending precision order (e.g.
  * {@link ExactSubsumptionStrategy} before {@link ScanSubsumptionStrategy}
- * before {@link AggSubsumptionStrategy}).
+ * before {@link AggregationSubsumptionStrategy}).
  *
  * <p>Thread-safety: this class is immutable after construction and safe to share.
  */

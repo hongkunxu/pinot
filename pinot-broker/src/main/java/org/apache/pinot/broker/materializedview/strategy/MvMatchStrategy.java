@@ -16,7 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-package org.apache.pinot.broker.materializedview.rewriter;
+package org.apache.pinot.broker.materializedview.strategy;
 
 import javax.annotation.Nullable;
 import org.apache.pinot.broker.materializedview.MvMatchResult;
