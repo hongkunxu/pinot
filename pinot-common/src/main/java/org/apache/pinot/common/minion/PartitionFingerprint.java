@@ -1,0 +1,143 @@
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.pinot.common.minion;
+
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Objects;
+
+
+/**
+ * Fingerprint of a materialized partition, capturing how many base segments contributed
+ * and their aggregate CRC. Used to detect when base table data has changed since the
+ * partition was last materialized.
+ *
+ * <p>Single-entry serialized form: {@code "segmentCount,crcChecksum"} for ZNRecord map fields.
+ *
+ * <p>Map serialized form (for task config transport):
+ * {@code "partStartMs1=segCnt1,crc1;partStartMs2=segCnt2,crc2"}.
+ *
+ * <p>Thread-safety: instances are immutable after construction.
+ */
+public class PartitionFingerprint {
+  private static final char SEPARATOR = ',';
+
+  private final int _segmentCount;
+  private final long _crcChecksum;
+
+  public PartitionFingerprint(int segmentCount, long crcChecksum) {
+    _segmentCount = segmentCount;
+    _crcChecksum = crcChecksum;
+  }
+
+  public int getSegmentCount() {
+    return _segmentCount;
+  }
+
+  public long getCrcChecksum() {
+    return _crcChecksum;
+  }
+
+  /**
+   * Encodes this fingerprint as {@code "segmentCount,crcChecksum"}.
+   */
+  public String encode() {
+    return _segmentCount + String.valueOf(SEPARATOR) + _crcChecksum;
+  }
+
+  /**
+   * Decodes a fingerprint from the format {@code "segmentCount,crcChecksum"}.
+   *
+   * @throws IllegalArgumentException if the string is malformed
+   */
+  public static PartitionFingerprint decode(String encoded) {
+    int separatorIdx = encoded.indexOf(SEPARATOR);
+    if (separatorIdx < 0) {
+      throw new IllegalArgumentException("Invalid PartitionFingerprint encoding: " + encoded);
+    }
+    int segmentCount = Integer.parseInt(encoded.substring(0, separatorIdx));
+    long crcChecksum = Long.parseLong(encoded.substring(separatorIdx + 1));
+    return new PartitionFingerprint(segmentCount, crcChecksum);
+  }
+
+  /**
+   * Encodes a map of partition fingerprints as
+   * {@code "partStartMs1=segCnt1,crc1;partStartMs2=segCnt2,crc2"}.
+   */
+  public static String encodeMap(Map<Long, PartitionFingerprint> map) {
+    if (map == null || map.isEmpty()) {
+      return "";
+    }
+    StringBuilder sb = new StringBuilder();
+    boolean first = true;
+    for (Map.Entry<Long, PartitionFingerprint> entry : map.entrySet()) {
+      if (!first) {
+        sb.append(';');
+      }
+      sb.append(entry.getKey()).append('=').append(entry.getValue().encode());
+      first = false;
+    }
+    return sb.toString();
+  }
+
+  /**
+   * Decodes a map of partition fingerprints from the format produced by {@link #encodeMap}.
+   *
+   * @return empty map if the input is null or blank
+   * @throws IllegalArgumentException if any entry is malformed
+   */
+  public static Map<Long, PartitionFingerprint> decodeMap(String encoded) {
+    Map<Long, PartitionFingerprint> map = new HashMap<>();
+    if (encoded == null || encoded.isEmpty()) {
+      return map;
+    }
+    for (String entry : encoded.split(";")) {
+      int eqIdx = entry.indexOf('=');
+      if (eqIdx < 0) {
+        throw new IllegalArgumentException("Invalid partition fingerprint map entry: " + entry);
+      }
+      long partitionStartMs = Long.parseLong(entry.substring(0, eqIdx));
+      PartitionFingerprint fp = decode(entry.substring(eqIdx + 1));
+      map.put(partitionStartMs, fp);
+    }
+    return map;
+  }
+
+  @Override
+  public boolean equals(Object o) {
+    if (this == o) {
+      return true;
+    }
+    if (o == null || getClass() != o.getClass()) {
+      return false;
+    }
+    PartitionFingerprint that = (PartitionFingerprint) o;
+    return _segmentCount == that._segmentCount && _crcChecksum == that._crcChecksum;
+  }
+
+  @Override
+  public int hashCode() {
+    return Objects.hash(_segmentCount, _crcChecksum);
+  }
+
+  @Override
+  public String toString() {
+    return "PartitionFingerprint{segmentCount=" + _segmentCount + ", crcChecksum=" + _crcChecksum + "}";
+  }
+}

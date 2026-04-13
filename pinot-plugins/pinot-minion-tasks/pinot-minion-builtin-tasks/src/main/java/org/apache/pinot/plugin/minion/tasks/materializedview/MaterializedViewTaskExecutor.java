@@ -41,6 +41,7 @@ import org.apache.pinot.common.metadata.segment.SegmentZKMetadataCustomMapModifi
 import org.apache.pinot.common.minion.MaterializedViewMetadata;
 import org.apache.pinot.common.minion.MaterializedViewMetadataUtils;
 import org.apache.pinot.common.minion.MaterializedViewTaskMetadata;
+import org.apache.pinot.common.minion.PartitionFingerprint;
 import org.apache.pinot.common.restlet.resources.StartReplaceSegmentsRequest;
 import org.apache.pinot.common.utils.DataSchema;
 import org.apache.pinot.common.utils.TarCompressionUtils;
@@ -297,7 +298,26 @@ public class MaterializedViewTaskExecutor extends BaseTaskExecutor {
     String tableName = configs.get(MinionConstants.TABLE_NAME_KEY);
     long watermarkMs = Long.parseLong(configs.get(MaterializedViewTask.WINDOW_END_MS_KEY));
 
-    MaterializedViewTaskMetadata newMetadata = new MaterializedViewTaskMetadata(tableName, watermarkMs);
+    // Read existing metadata to preserve accumulated partition fingerprints
+    ZNRecord existingZnRecord = _minionTaskZkMetadataManager.getTaskMetadataZNRecord(
+        tableName, MaterializedViewTask.TASK_TYPE);
+    Map<Long, PartitionFingerprint> mergedFingerprints = new HashMap<>();
+    if (existingZnRecord != null) {
+      MaterializedViewTaskMetadata existingMetadata =
+          MaterializedViewTaskMetadata.fromZNRecord(existingZnRecord);
+      mergedFingerprints.putAll(existingMetadata.getPartitionFingerprints());
+    }
+
+    // Merge fingerprints from this task execution
+    String fingerprintStr = configs.get(MaterializedViewTask.PARTITION_FINGERPRINTS_KEY);
+    if (fingerprintStr != null && !fingerprintStr.isEmpty()) {
+      Map<Long, PartitionFingerprint> taskFingerprints = PartitionFingerprint.decodeMap(fingerprintStr);
+      mergedFingerprints.putAll(taskFingerprints);
+      LOGGER.info("Merged {} partition fingerprint(s) for table: {}", taskFingerprints.size(), tableName);
+    }
+
+    MaterializedViewTaskMetadata newMetadata =
+        new MaterializedViewTaskMetadata(tableName, watermarkMs, mergedFingerprints);
     _minionTaskZkMetadataManager.setTaskMetadataZNRecord(newMetadata,
         MaterializedViewTask.TASK_TYPE, _expectedVersion);
 

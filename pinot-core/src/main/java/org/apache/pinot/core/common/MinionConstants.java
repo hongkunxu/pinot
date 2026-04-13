@@ -368,6 +368,7 @@ public class MinionConstants {
     public static final String WINDOW_START_MS_KEY = "windowStartMs";
     public static final String WINDOW_END_MS_KEY = "windowEndMs";
     public static final String SOURCE_TABLE_NAME_KEY = "sourceTableName";
+    public static final String PARTITION_FINGERPRINTS_KEY = "partitionFingerprints";
 
     public static final int DEFAULT_MAX_NUM_RECORDS_PER_SEGMENT = 4000;
   }

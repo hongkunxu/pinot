@@ -30,6 +30,7 @@ import org.apache.pinot.common.metadata.segment.SegmentZKMetadata;
 import org.apache.pinot.common.minion.MaterializedViewMetadata;
 import org.apache.pinot.common.minion.MaterializedViewMetadataUtils;
 import org.apache.pinot.common.minion.MaterializedViewTaskMetadata;
+import org.apache.pinot.common.minion.PartitionFingerprint;
 import org.apache.pinot.controller.helix.core.minion.generator.BaseTaskGenerator;
 import org.apache.pinot.controller.helix.core.minion.generator.TaskGeneratorUtils;
 import org.apache.pinot.core.common.MinionConstants;
@@ -133,6 +134,11 @@ public class MaterializedViewTaskGenerator extends BaseTaskGenerator {
         continue;
       }
 
+      // Compute partition fingerprint for the source segments overlapping this window
+      String sourceTableWithType = resolveSourceTableNameWithType(sourceTableName);
+      PartitionFingerprint windowFingerprint =
+          computeWindowFingerprint(sourceTableWithType, windowStartMs, windowEndMs);
+
       // Resolve source time column and append time-range WHERE filter.
       // The time column transformation is already expressed in the user-defined SQL SELECT/GROUP BY.
       String sourceTimeColumn = resolveSourceTimeColumn(sourceTableName);
@@ -156,6 +162,12 @@ public class MaterializedViewTaskGenerator extends BaseTaskGenerator {
       if (maxNumRecords != null) {
         configs.put(MaterializedViewTask.MAX_NUM_RECORDS_PER_SEGMENT_KEY, maxNumRecords);
       }
+
+      // Partition fingerprint for this window — executor will persist into ZK metadata
+      Map<Long, PartitionFingerprint> fingerprintMap = new HashMap<>();
+      fingerprintMap.put(windowStartMs, windowFingerprint);
+      configs.put(MaterializedViewTask.PARTITION_FINGERPRINTS_KEY,
+          PartitionFingerprint.encodeMap(fingerprintMap));
 
       pinotTaskConfigs.add(new PinotTaskConfig(taskType, configs));
       LOGGER.info("Finished generating task configs for table: {} for task: {}", offlineTableName, taskType);
@@ -320,5 +332,28 @@ public class MaterializedViewTaskGenerator extends BaseTaskGenerator {
     Preconditions.checkState(sourceTableConfig != null,
         "Source table config not found for: %s", rawSourceTableName);
     return sourceTableWithType;
+  }
+
+  /**
+   * Computes a {@link PartitionFingerprint} for the given time window by scanning
+   * source table segments whose time range overlaps {@code [windowStartMs, windowEndMs)}.
+   * The fingerprint captures the count and aggregate CRC of all contributing segments.
+   */
+  private PartitionFingerprint computeWindowFingerprint(String sourceTableWithType,
+      long windowStartMs, long windowEndMs) {
+    List<SegmentZKMetadata> allSegments = getSegmentsZKMetadataForTable(sourceTableWithType);
+    int segmentCount = 0;
+    long crcChecksum = 0;
+    for (SegmentZKMetadata seg : allSegments) {
+      long segStartMs = seg.getStartTimeMs();
+      long segEndMs = seg.getEndTimeMs();
+      if (segStartMs < windowEndMs && segEndMs >= windowStartMs) {
+        segmentCount++;
+        crcChecksum += seg.getCrc();
+      }
+    }
+    LOGGER.info("Computed partition fingerprint for window [{}, {}): segmentCount={}, crcChecksum={}",
+        windowStartMs, windowEndMs, segmentCount, crcChecksum);
+    return new PartitionFingerprint(segmentCount, crcChecksum);
   }
 }
