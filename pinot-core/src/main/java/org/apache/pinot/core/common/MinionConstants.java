@@ -370,6 +370,10 @@ public class MinionConstants {
     public static final String SOURCE_TABLE_NAME_KEY = "sourceTableName";
     public static final String PARTITION_FINGERPRINTS_KEY = "partitionFingerprints";
 
+    public static final String TASK_MODE_KEY = "taskMode";
+    public static final String TASK_MODE_APPEND = "APPEND";
+    public static final String TASK_MODE_OVERWRITE = "OVERWRITE";
+
     public static final int DEFAULT_MAX_NUM_RECORDS_PER_SEGMENT = 4000;
   }
 }

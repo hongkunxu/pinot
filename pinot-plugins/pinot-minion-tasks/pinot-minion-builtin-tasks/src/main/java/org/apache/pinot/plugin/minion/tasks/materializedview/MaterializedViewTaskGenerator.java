@@ -31,6 +31,8 @@ import org.apache.pinot.common.minion.MaterializedViewMetadata;
 import org.apache.pinot.common.minion.MaterializedViewMetadataUtils;
 import org.apache.pinot.common.minion.MaterializedViewTaskMetadata;
 import org.apache.pinot.common.minion.PartitionFingerprint;
+import org.apache.pinot.common.minion.PartitionInfo;
+import org.apache.pinot.common.minion.PartitionState;
 import org.apache.pinot.controller.helix.core.minion.generator.BaseTaskGenerator;
 import org.apache.pinot.controller.helix.core.minion.generator.TaskGeneratorUtils;
 import org.apache.pinot.core.common.MinionConstants;
@@ -56,17 +58,17 @@ import org.slf4j.LoggerFactory;
  * computes a time window and appends it to the user-defined SQL, producing a
  * {@link PinotTaskConfig} for the executor.
  *
- * <p>Steps:
+ * <p>Three-step decision logic (evaluated per table, per schedule cycle):
  * <ol>
- *   <li>Parse the source table name from the SQL {@code FROM} clause.</li>
- *   <li>Read the watermark from {@link MaterializedViewTaskMetadata} ZNode.
- *       On cold-start, find the minimum segment start time from the source table and
- *       align it to the bucket boundary.</li>
- *   <li>Compute the execution window: {@code [watermarkMs, watermarkMs + bucketMs)}.</li>
- *   <li>Skip if the window end is in the future.</li>
- *   <li>Look up the source table's time column and append a {@code WHERE} time-range
- *       filter to the SQL.</li>
- *   <li>Emit a single {@link PinotTaskConfig} per table.</li>
+ *   <li><b>Overwrite STALE</b> – If any partition is marked {@link PartitionState#STALE},
+ *       generate an {@code OVERWRITE} task for the earliest one. This has the highest
+ *       priority to maintain consistency.</li>
+ *   <li><b>Append</b> – If no STALE partitions exist and the watermark can advance (next
+ *       window is outside the buffer period), generate a normal {@code APPEND} task.</li>
+ *   <li><b>Scan for mismatches</b> – If the watermark cannot advance (MV is caught up),
+ *       re-compute fingerprints for all {@link PartitionState#VALID} partitions and mark
+ *       mismatches as {@link PartitionState#STALE} in ZK. No task is emitted; the stale
+ *       partitions will be picked up in the next cycle (Step 1).</li>
  * </ol>
  */
 @TaskGenerator
@@ -112,8 +114,8 @@ public class MaterializedViewTaskGenerator extends BaseTaskGenerator {
       Preconditions.checkState(definedSQL != null && !definedSQL.isEmpty(),
           "definedSQL must be specified for table: %s", offlineTableName);
 
-      // Parse source table via Calcite AST -- needed for cold-start watermark computation
       String sourceTableName = MaterializedViewAnalyzer.extractSourceTableName(definedSQL);
+      String sourceTableWithType = resolveSourceTableNameWithType(sourceTableName);
 
       // Bucket and buffer
       String bucketTimePeriod =
@@ -123,56 +125,157 @@ public class MaterializedViewTaskGenerator extends BaseTaskGenerator {
           taskConfigs.getOrDefault(MaterializedViewTask.BUFFER_TIME_PERIOD_KEY, "0d");
       long bufferMs = TimeUtils.convertPeriodToMillis(bufferTimePeriod);
 
-      // Watermark (cold-start uses source table's earliest segment time)
-      long windowStartMs = getWatermarkMs(offlineTableName, sourceTableName, bucketMs, definedSQL);
-      long windowEndMs = windowStartMs + bucketMs;
+      // Load task metadata (ZNRecord + version for optimistic locking)
+      ZNRecord znRecord = _clusterInfoAccessor.getMinionTaskMetadataZNRecord(
+          MaterializedViewTask.TASK_TYPE, offlineTableName);
+      long watermarkMs = getWatermarkMs(offlineTableName, sourceTableName, bucketMs, definedSQL);
+      Map<Long, PartitionInfo> partitionInfos = new HashMap<>();
+      int metadataVersion = -1;
+      if (znRecord != null) {
+        MaterializedViewTaskMetadata existingMeta = MaterializedViewTaskMetadata.fromZNRecord(znRecord);
+        partitionInfos = existingMeta.getPartitionInfos();
+        metadataVersion = znRecord.getVersion();
+      }
 
-      // Skip if window end is too recent (within buffer period from now)
-      if (windowEndMs > System.currentTimeMillis() - bufferMs) {
-        LOGGER.info("Window [{}, {}) is within buffer period ({}) from now. Skipping task: {}",
-            windowStartMs, windowEndMs, bufferTimePeriod, taskType);
+      // ── Step 1: Overwrite STALE partitions (highest priority) ──
+      PinotTaskConfig overwriteTask = tryGenerateOverwriteTask(offlineTableName, sourceTableName,
+          sourceTableWithType, definedSQL, taskConfigs, partitionInfos, bucketMs);
+      if (overwriteTask != null) {
+        pinotTaskConfigs.add(overwriteTask);
+        LOGGER.info("Generated OVERWRITE task for table: {}", offlineTableName);
         continue;
       }
 
-      // Compute partition fingerprint for the source segments overlapping this window
-      String sourceTableWithType = resolveSourceTableNameWithType(sourceTableName);
-      PartitionFingerprint windowFingerprint =
-          computeWindowFingerprint(sourceTableWithType, windowStartMs, windowEndMs);
+      // ── Step 2: Append new data (advance watermark) ──
+      long windowStartMs = watermarkMs;
+      long windowEndMs = windowStartMs + bucketMs;
 
-      // Resolve source time column and append time-range WHERE filter.
-      // The time column transformation is already expressed in the user-defined SQL SELECT/GROUP BY.
-      String sourceTimeColumn = resolveSourceTimeColumn(sourceTableName);
-      DateTimeFormatSpec timeFormatSpec = resolveSourceTimeFormatSpec(sourceTableName, sourceTimeColumn);
-      String windowStart = timeFormatSpec.fromMillisToFormat(windowStartMs);
-      String windowEnd = timeFormatSpec.fromMillisToFormat(windowEndMs);
-      String sqlWithTimeRange = appendTimeRange(definedSQL, sourceTimeColumn, windowStart, windowEnd);
-
-      // Build task config
-      Map<String, String> configs = new HashMap<>();
-      configs.put(MinionConstants.TABLE_NAME_KEY, offlineTableName);
-      configs.put(MaterializedViewTask.DEFINED_SQL_KEY, sqlWithTimeRange);
-      configs.put(MaterializedViewTask.ORIGINAL_DEFINED_SQL_KEY, definedSQL);
-      configs.put(MaterializedViewTask.WINDOW_START_MS_KEY, String.valueOf(windowStartMs));
-      configs.put(MaterializedViewTask.WINDOW_END_MS_KEY, String.valueOf(windowEndMs));
-      configs.put(MaterializedViewTask.SOURCE_TABLE_NAME_KEY, sourceTableName);
-      configs.put(MinionConstants.UPLOAD_URL_KEY,
-          _clusterInfoAccessor.getVipUrl() + "/segments");
-
-      String maxNumRecords = taskConfigs.get(MaterializedViewTask.MAX_NUM_RECORDS_PER_SEGMENT_KEY);
-      if (maxNumRecords != null) {
-        configs.put(MaterializedViewTask.MAX_NUM_RECORDS_PER_SEGMENT_KEY, maxNumRecords);
+      if (windowEndMs <= System.currentTimeMillis() - bufferMs) {
+        PinotTaskConfig appendTask = buildTaskConfig(offlineTableName, sourceTableName,
+            sourceTableWithType, definedSQL, taskConfigs, windowStartMs, windowEndMs,
+            MaterializedViewTask.TASK_MODE_APPEND);
+        pinotTaskConfigs.add(appendTask);
+        LOGGER.info("Generated APPEND task for table: {} window [{}, {})", offlineTableName,
+            windowStartMs, windowEndMs);
+        continue;
       }
 
-      // Partition fingerprint for this window — executor will persist into ZK metadata
-      Map<Long, PartitionFingerprint> fingerprintMap = new HashMap<>();
-      fingerprintMap.put(windowStartMs, windowFingerprint);
-      configs.put(MaterializedViewTask.PARTITION_FINGERPRINTS_KEY,
-          PartitionFingerprint.encodeMap(fingerprintMap));
-
-      pinotTaskConfigs.add(new PinotTaskConfig(taskType, configs));
-      LOGGER.info("Finished generating task configs for table: {} for task: {}", offlineTableName, taskType);
+      // ── Step 3: Watermark can't advance — scan VALID partitions for mismatches ──
+      LOGGER.info("MV table {} is caught up (watermark={}). Scanning VALID partitions for data changes...",
+          offlineTableName, watermarkMs);
+      scanAndMarkStalePartitions(offlineTableName, sourceTableWithType, partitionInfos,
+          bucketMs, metadataVersion, watermarkMs);
     }
     return pinotTaskConfigs;
+  }
+
+  /**
+   * Step 1: Finds the earliest STALE partition and generates an OVERWRITE task for it.
+   *
+   * @return a {@link PinotTaskConfig} for overwrite, or {@code null} if no STALE partitions exist
+   */
+  private PinotTaskConfig tryGenerateOverwriteTask(String mvTableName, String sourceTableName,
+      String sourceTableWithType, String definedSQL, Map<String, String> taskConfigs,
+      Map<Long, PartitionInfo> partitionInfos, long bucketMs) {
+    long earliestStaleMs = Long.MAX_VALUE;
+    for (Map.Entry<Long, PartitionInfo> entry : partitionInfos.entrySet()) {
+      if (entry.getValue().getState() == PartitionState.STALE && entry.getKey() < earliestStaleMs) {
+        earliestStaleMs = entry.getKey();
+      }
+    }
+    if (earliestStaleMs == Long.MAX_VALUE) {
+      return null;
+    }
+    long windowStartMs = earliestStaleMs;
+    long windowEndMs = windowStartMs + bucketMs;
+    LOGGER.info("Found STALE partition at {} for table: {}. Generating OVERWRITE task for window [{}, {})",
+        windowStartMs, mvTableName, windowStartMs, windowEndMs);
+    return buildTaskConfig(mvTableName, sourceTableName, sourceTableWithType, definedSQL,
+        taskConfigs, windowStartMs, windowEndMs, MaterializedViewTask.TASK_MODE_OVERWRITE);
+  }
+
+  /**
+   * Step 3: Re-computes fingerprints for all VALID partitions and marks any with mismatched
+   * fingerprints as STALE in ZK. No task is generated; the stale partitions will be handled
+   * in the next scheduling cycle.
+   */
+  private void scanAndMarkStalePartitions(String mvTableName, String sourceTableWithType,
+      Map<Long, PartitionInfo> partitionInfos, long bucketMs, int metadataVersion,
+      long watermarkMs) {
+    if (partitionInfos.isEmpty()) {
+      return;
+    }
+    List<SegmentZKMetadata> allSegments = getSegmentsZKMetadataForTable(sourceTableWithType);
+    boolean anyMarkedStale = false;
+
+    for (Map.Entry<Long, PartitionInfo> entry : partitionInfos.entrySet()) {
+      if (entry.getValue().getState() != PartitionState.VALID) {
+        continue;
+      }
+      long partitionStartMs = entry.getKey();
+      long partitionEndMs = partitionStartMs + bucketMs;
+      PartitionFingerprint currentFp = computeWindowFingerprint(allSegments, partitionStartMs, partitionEndMs);
+      PartitionFingerprint storedFp = entry.getValue().getFingerprint();
+
+      if (!currentFp.equals(storedFp)) {
+        LOGGER.info("Partition [{}, {}) fingerprint mismatch for table: {}. "
+                + "Stored: {}, Current: {}. Marking STALE.",
+            partitionStartMs, partitionEndMs, mvTableName, storedFp, currentFp);
+        entry.setValue(entry.getValue().withState(PartitionState.STALE));
+        anyMarkedStale = true;
+      }
+    }
+
+    if (anyMarkedStale) {
+      MaterializedViewTaskMetadata updatedMetadata =
+          new MaterializedViewTaskMetadata(mvTableName, watermarkMs, partitionInfos);
+      _clusterInfoAccessor.setMinionTaskMetadata(updatedMetadata,
+          MaterializedViewTask.TASK_TYPE, metadataVersion);
+      LOGGER.info("Updated task metadata with STALE partitions for table: {}", mvTableName);
+    } else {
+      LOGGER.info("All VALID partitions are consistent for table: {}", mvTableName);
+    }
+  }
+
+  /**
+   * Builds a complete {@link PinotTaskConfig} for either APPEND or OVERWRITE mode.
+   */
+  private PinotTaskConfig buildTaskConfig(String mvTableName, String sourceTableName,
+      String sourceTableWithType, String definedSQL, Map<String, String> taskConfigs,
+      long windowStartMs, long windowEndMs, String taskMode) {
+    String taskType = MaterializedViewTask.TASK_TYPE;
+
+    PartitionFingerprint windowFingerprint =
+        computeWindowFingerprint(sourceTableWithType, windowStartMs, windowEndMs);
+
+    String sourceTimeColumn = resolveSourceTimeColumn(sourceTableName);
+    DateTimeFormatSpec timeFormatSpec = resolveSourceTimeFormatSpec(sourceTableName, sourceTimeColumn);
+    String windowStart = timeFormatSpec.fromMillisToFormat(windowStartMs);
+    String windowEnd = timeFormatSpec.fromMillisToFormat(windowEndMs);
+    String sqlWithTimeRange = appendTimeRange(definedSQL, sourceTimeColumn, windowStart, windowEnd);
+
+    Map<String, String> configs = new HashMap<>();
+    configs.put(MinionConstants.TABLE_NAME_KEY, mvTableName);
+    configs.put(MaterializedViewTask.DEFINED_SQL_KEY, sqlWithTimeRange);
+    configs.put(MaterializedViewTask.ORIGINAL_DEFINED_SQL_KEY, definedSQL);
+    configs.put(MaterializedViewTask.WINDOW_START_MS_KEY, String.valueOf(windowStartMs));
+    configs.put(MaterializedViewTask.WINDOW_END_MS_KEY, String.valueOf(windowEndMs));
+    configs.put(MaterializedViewTask.SOURCE_TABLE_NAME_KEY, sourceTableName);
+    configs.put(MaterializedViewTask.TASK_MODE_KEY, taskMode);
+    configs.put(MinionConstants.UPLOAD_URL_KEY,
+        _clusterInfoAccessor.getVipUrl() + "/segments");
+
+    String maxNumRecords = taskConfigs.get(MaterializedViewTask.MAX_NUM_RECORDS_PER_SEGMENT_KEY);
+    if (maxNumRecords != null) {
+      configs.put(MaterializedViewTask.MAX_NUM_RECORDS_PER_SEGMENT_KEY, maxNumRecords);
+    }
+
+    Map<Long, PartitionFingerprint> fingerprintMap = new HashMap<>();
+    fingerprintMap.put(windowStartMs, windowFingerprint);
+    configs.put(MaterializedViewTask.PARTITION_FINGERPRINTS_KEY,
+        PartitionFingerprint.encodeMap(fingerprintMap));
+
+    return new PinotTaskConfig(taskType, configs);
   }
 
   @Override
@@ -335,13 +438,21 @@ public class MaterializedViewTaskGenerator extends BaseTaskGenerator {
   }
 
   /**
-   * Computes a {@link PartitionFingerprint} for the given time window by scanning
-   * source table segments whose time range overlaps {@code [windowStartMs, windowEndMs)}.
-   * The fingerprint captures the count and aggregate CRC of all contributing segments.
+   * Computes a {@link PartitionFingerprint} by fetching segments from ZK.
    */
   private PartitionFingerprint computeWindowFingerprint(String sourceTableWithType,
       long windowStartMs, long windowEndMs) {
-    List<SegmentZKMetadata> allSegments = getSegmentsZKMetadataForTable(sourceTableWithType);
+    return computeWindowFingerprint(getSegmentsZKMetadataForTable(sourceTableWithType),
+        windowStartMs, windowEndMs);
+  }
+
+  /**
+   * Computes a {@link PartitionFingerprint} for the given time window from pre-fetched
+   * segment metadata. Counts segments whose time range overlaps
+   * {@code [windowStartMs, windowEndMs)} and sums their CRCs.
+   */
+  private PartitionFingerprint computeWindowFingerprint(List<SegmentZKMetadata> allSegments,
+      long windowStartMs, long windowEndMs) {
     int segmentCount = 0;
     long crcChecksum = 0;
     for (SegmentZKMetadata seg : allSegments) {

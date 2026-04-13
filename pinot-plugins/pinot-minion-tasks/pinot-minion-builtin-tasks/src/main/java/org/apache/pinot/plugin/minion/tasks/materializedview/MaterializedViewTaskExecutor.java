@@ -42,6 +42,8 @@ import org.apache.pinot.common.minion.MaterializedViewMetadata;
 import org.apache.pinot.common.minion.MaterializedViewMetadataUtils;
 import org.apache.pinot.common.minion.MaterializedViewTaskMetadata;
 import org.apache.pinot.common.minion.PartitionFingerprint;
+import org.apache.pinot.common.minion.PartitionInfo;
+import org.apache.pinot.common.minion.PartitionState;
 import org.apache.pinot.common.restlet.resources.StartReplaceSegmentsRequest;
 import org.apache.pinot.common.utils.DataSchema;
 import org.apache.pinot.common.utils.TarCompressionUtils;
@@ -100,6 +102,8 @@ public class MaterializedViewTaskExecutor extends BaseTaskExecutor {
   public void preProcess(PinotTaskConfig pinotTaskConfig) {
     Map<String, String> configs = pinotTaskConfig.getConfigs();
     String tableName = configs.get(MinionConstants.TABLE_NAME_KEY);
+    String taskMode = configs.getOrDefault(MaterializedViewTask.TASK_MODE_KEY,
+        MaterializedViewTask.TASK_MODE_APPEND);
 
     ZNRecord znRecord = _minionTaskZkMetadataManager.getTaskMetadataZNRecord(
         tableName, MaterializedViewTask.TASK_TYPE);
@@ -108,9 +112,18 @@ public class MaterializedViewTaskExecutor extends BaseTaskExecutor {
 
     MaterializedViewTaskMetadata metadata = MaterializedViewTaskMetadata.fromZNRecord(znRecord);
     long windowStartMs = Long.parseLong(configs.get(MaterializedViewTask.WINDOW_START_MS_KEY));
-    Preconditions.checkState(metadata.getWatermarkMs() <= windowStartMs,
-        "watermarkMs %d should not be larger than windowStartMs %d for table %s",
-        metadata.getWatermarkMs(), windowStartMs, tableName);
+
+    if (MaterializedViewTask.TASK_MODE_APPEND.equals(taskMode)) {
+      Preconditions.checkState(metadata.getWatermarkMs() <= windowStartMs,
+          "watermarkMs %d should not be larger than windowStartMs %d for table %s",
+          metadata.getWatermarkMs(), windowStartMs, tableName);
+    } else {
+      // OVERWRITE: target partition must already be tracked and must be STALE
+      PartitionInfo partitionInfo = metadata.getPartitionInfos().get(windowStartMs);
+      Preconditions.checkState(partitionInfo != null && partitionInfo.getState() == PartitionState.STALE,
+          "Overwrite target partition %d should exist and be STALE for table %s",
+          windowStartMs, tableName);
+    }
 
     _expectedVersion = znRecord.getVersion();
 
@@ -198,9 +211,8 @@ public class MaterializedViewTaskExecutor extends BaseTaskExecutor {
         int toIndex = Math.min(fromIndex + maxNumRecordsPerSegment, totalRows);
         List<GenericRow> chunk = rows.subList(fromIndex, toIndex);
 
-        String segmentName = numSegments == 1
-            ? tableName + "_" + windowStartMs + "_" + windowEndMs
-            : tableName + "_" + windowStartMs + "_" + windowEndMs + "_" + segIdx;
+        String segmentName = tableName + "_" + windowStartMs + "_" + windowEndMs
+            + "_" + System.currentTimeMillis();
 
         File segmentOutputDir = new File(tempDir, "segmentOutput_" + segIdx);
         FileUtils.forceMkdir(segmentOutputDir);
@@ -296,28 +308,51 @@ public class MaterializedViewTaskExecutor extends BaseTaskExecutor {
   public void postProcess(PinotTaskConfig pinotTaskConfig) {
     Map<String, String> configs = pinotTaskConfig.getConfigs();
     String tableName = configs.get(MinionConstants.TABLE_NAME_KEY);
-    long watermarkMs = Long.parseLong(configs.get(MaterializedViewTask.WINDOW_END_MS_KEY));
+    String taskMode = configs.getOrDefault(MaterializedViewTask.TASK_MODE_KEY,
+        MaterializedViewTask.TASK_MODE_APPEND);
+    long windowStartMs = Long.parseLong(configs.get(MaterializedViewTask.WINDOW_START_MS_KEY));
+    long windowEndMs = Long.parseLong(configs.get(MaterializedViewTask.WINDOW_END_MS_KEY));
 
-    // Read existing metadata to preserve accumulated partition fingerprints
+    // Read existing metadata to preserve accumulated partition infos
     ZNRecord existingZnRecord = _minionTaskZkMetadataManager.getTaskMetadataZNRecord(
         tableName, MaterializedViewTask.TASK_TYPE);
-    Map<Long, PartitionFingerprint> mergedFingerprints = new HashMap<>();
+    Map<Long, PartitionInfo> mergedInfos = new HashMap<>();
+    long existingWatermark = 0;
     if (existingZnRecord != null) {
       MaterializedViewTaskMetadata existingMetadata =
           MaterializedViewTaskMetadata.fromZNRecord(existingZnRecord);
-      mergedFingerprints.putAll(existingMetadata.getPartitionFingerprints());
+      mergedInfos.putAll(existingMetadata.getPartitionInfos());
+      existingWatermark = existingMetadata.getWatermarkMs();
     }
 
-    // Merge fingerprints from this task execution
+    // Build the new PartitionInfo for the completed partition
+    PartitionFingerprint newFingerprint = null;
     String fingerprintStr = configs.get(MaterializedViewTask.PARTITION_FINGERPRINTS_KEY);
     if (fingerprintStr != null && !fingerprintStr.isEmpty()) {
       Map<Long, PartitionFingerprint> taskFingerprints = PartitionFingerprint.decodeMap(fingerprintStr);
-      mergedFingerprints.putAll(taskFingerprints);
-      LOGGER.info("Merged {} partition fingerprint(s) for table: {}", taskFingerprints.size(), tableName);
+      newFingerprint = taskFingerprints.get(windowStartMs);
+    }
+    if (newFingerprint == null) {
+      newFingerprint = new PartitionFingerprint(0, 0);
+    }
+    long nowMs = System.currentTimeMillis();
+    PartitionInfo completedInfo = new PartitionInfo(PartitionState.VALID, newFingerprint, nowMs);
+    mergedInfos.put(windowStartMs, completedInfo);
+    LOGGER.info("Set partition {} to VALID (lastRefreshMs={}) for table: {}", windowStartMs, nowMs, tableName);
+
+    // Advance watermark only for APPEND tasks
+    long newWatermark;
+    if (MaterializedViewTask.TASK_MODE_APPEND.equals(taskMode)) {
+      newWatermark = windowEndMs;
+      LOGGER.info("APPEND mode: advancing watermark from {} to {} for table: {}",
+          existingWatermark, newWatermark, tableName);
+    } else {
+      newWatermark = existingWatermark;
+      LOGGER.info("OVERWRITE mode: keeping watermark at {} for table: {}", newWatermark, tableName);
     }
 
     MaterializedViewTaskMetadata newMetadata =
-        new MaterializedViewTaskMetadata(tableName, watermarkMs, mergedFingerprints);
+        new MaterializedViewTaskMetadata(tableName, newWatermark, mergedInfos);
     _minionTaskZkMetadataManager.setTaskMetadataZNRecord(newMetadata,
         MaterializedViewTask.TASK_TYPE, _expectedVersion);
 

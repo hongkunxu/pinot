@@ -29,43 +29,37 @@ import org.apache.helix.zookeeper.datamodel.ZNRecord;
  * <p>Contains two kinds of state:
  * <ul>
  *   <li>{@code watermarkMs} – the time (exclusive) up to which tasks have been executed.</li>
- *   <li>{@code partitionFingerprints} – per-partition fingerprint (segment count + CRC checksum)
- *       recorded at materialization time, used to detect base table data changes.</li>
+ *   <li>{@code partitionInfos} – per-partition info (state, fingerprint, lastRefreshMs)
+ *       recorded at materialization time, used to track partition freshness and detect
+ *       base table data changes.</li>
  * </ul>
  *
  * <p>This gets serialized and stored in ZooKeeper under the path
  * MINION_TASK_METADATA/${tableNameWithType}/MaterializedViewTask
  *
- * <p>PinotTaskGenerator:
- * The {@code watermarkMs} is used by the {@code MaterializedViewTaskGenerator}
- * to determine the execution window: [watermarkMs, watermarkMs + bucketSize).
- *
- * <p>PinotTaskExecutor:
- * The same watermark is used by the {@code MaterializedViewTaskExecutor} to:
- * <ul>
- *   <li>Verify that it is running the latest task scheduled by the generator</li>
- *   <li>Update the watermark to the end of the window upon successful execution</li>
- *   <li>Persist the partition fingerprints for newly materialized partitions</li>
- * </ul>
+ * <p>Backward compatibility: older ZNRecords that contain the legacy
+ * {@code partitionFingerprints} mapField are automatically migrated to
+ * {@link PartitionInfo} with {@code state=VALID, lastRefreshMs=0}.
  */
 public class MaterializedViewTaskMetadata extends BaseTaskMetadata {
 
   private static final String WATERMARK_KEY = "watermarkMs";
-  private static final String PARTITION_FINGERPRINTS_MAP_KEY = "partitionFingerprints";
+  private static final String PARTITION_INFOS_MAP_KEY = "partitionInfos";
+  private static final String LEGACY_PARTITION_FINGERPRINTS_MAP_KEY = "partitionFingerprints";
 
   private final String _tableNameWithType;
   private final long _watermarkMs;
-  private final Map<Long, PartitionFingerprint> _partitionFingerprints;
+  private final Map<Long, PartitionInfo> _partitionInfos;
 
   public MaterializedViewTaskMetadata(String tableNameWithType, long watermarkMs) {
     this(tableNameWithType, watermarkMs, new HashMap<>());
   }
 
   public MaterializedViewTaskMetadata(String tableNameWithType, long watermarkMs,
-      Map<Long, PartitionFingerprint> partitionFingerprints) {
+      Map<Long, PartitionInfo> partitionInfos) {
     _tableNameWithType = tableNameWithType;
     _watermarkMs = watermarkMs;
-    _partitionFingerprints = partitionFingerprints;
+    _partitionInfos = partitionInfos;
   }
 
   @Override
@@ -78,27 +72,37 @@ public class MaterializedViewTaskMetadata extends BaseTaskMetadata {
   }
 
   /**
-   * Returns the mutable partition fingerprint map. Key is the partition start time in millis;
-   * value is the fingerprint recorded when the partition was last materialized.
+   * Returns the mutable partition info map. Key is the partition start time in millis.
    */
-  public Map<Long, PartitionFingerprint> getPartitionFingerprints() {
-    return _partitionFingerprints;
+  public Map<Long, PartitionInfo> getPartitionInfos() {
+    return _partitionInfos;
   }
 
   public static MaterializedViewTaskMetadata fromZNRecord(ZNRecord znRecord) {
     long watermark = znRecord.getLongField(WATERMARK_KEY, 0);
 
-    Map<Long, PartitionFingerprint> fingerprints = new HashMap<>();
-    Map<String, String> rawMap = znRecord.getMapField(PARTITION_FINGERPRINTS_MAP_KEY);
+    Map<Long, PartitionInfo> infos = new HashMap<>();
+
+    // Try new format first
+    Map<String, String> rawMap = znRecord.getMapField(PARTITION_INFOS_MAP_KEY);
     if (rawMap != null) {
       for (Map.Entry<String, String> entry : rawMap.entrySet()) {
         long partitionStartMs = Long.parseLong(entry.getKey());
-        PartitionFingerprint fp = PartitionFingerprint.decode(entry.getValue());
-        fingerprints.put(partitionStartMs, fp);
+        infos.put(partitionStartMs, PartitionInfo.decode(entry.getValue()));
+      }
+    } else {
+      // Fall back to legacy format: convert PartitionFingerprint -> PartitionInfo(VALID, fp, 0)
+      Map<String, String> legacyMap = znRecord.getMapField(LEGACY_PARTITION_FINGERPRINTS_MAP_KEY);
+      if (legacyMap != null) {
+        for (Map.Entry<String, String> entry : legacyMap.entrySet()) {
+          long partitionStartMs = Long.parseLong(entry.getKey());
+          PartitionFingerprint fp = PartitionFingerprint.decode(entry.getValue());
+          infos.put(partitionStartMs, PartitionInfo.fromLegacyFingerprint(fp));
+        }
       }
     }
 
-    return new MaterializedViewTaskMetadata(znRecord.getId(), watermark, fingerprints);
+    return new MaterializedViewTaskMetadata(znRecord.getId(), watermark, infos);
   }
 
   @Override
@@ -106,12 +110,12 @@ public class MaterializedViewTaskMetadata extends BaseTaskMetadata {
     ZNRecord znRecord = new ZNRecord(_tableNameWithType);
     znRecord.setLongField(WATERMARK_KEY, _watermarkMs);
 
-    if (!_partitionFingerprints.isEmpty()) {
+    if (!_partitionInfos.isEmpty()) {
       Map<String, String> rawMap = new HashMap<>();
-      for (Map.Entry<Long, PartitionFingerprint> entry : _partitionFingerprints.entrySet()) {
+      for (Map.Entry<Long, PartitionInfo> entry : _partitionInfos.entrySet()) {
         rawMap.put(Long.toString(entry.getKey()), entry.getValue().encode());
       }
-      znRecord.setMapField(PARTITION_FINGERPRINTS_MAP_KEY, rawMap);
+      znRecord.setMapField(PARTITION_INFOS_MAP_KEY, rawMap);
     }
 
     return znRecord;
