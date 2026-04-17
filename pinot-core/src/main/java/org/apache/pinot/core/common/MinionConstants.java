@@ -347,4 +347,44 @@ public class MinionConstants {
 
     public static final String MAX_ZK_CREATION_TIME_MILLIS_KEY = "maxZKCreationTimeMillis";
   }
+
+  /**
+   * Materializes pre-aggregated data into an OFFLINE table based on a user-defined SQL query.
+   * The generator computes a time window and appends it to the SQL; the executor queries the
+   * base table via the broker, builds segments from the results, and uploads them to the MV table.
+   *
+   * <p>Supports three task modes: {@code APPEND} (new time windows), {@code OVERWRITE}
+   * (re-materialize stale partitions), and {@code DELETE} (remove expired partitions).
+   *
+   * <p>User-facing config keys: {@code definedSQL}, {@code bucketTimePeriod},
+   * {@code bufferTimePeriod} (optional), {@code maxNumRecordsPerSegment} (optional, default 4000).
+   */
+  public static class MaterializedViewTask {
+    public static final String TASK_TYPE = "MaterializedViewTask";
+
+    public static final String DEFINED_SQL_KEY = "definedSQL";
+    public static final String BUCKET_TIME_PERIOD_KEY = "bucketTimePeriod";
+    public static final String BUFFER_TIME_PERIOD_KEY = "bufferTimePeriod";
+    public static final String MAX_NUM_RECORDS_PER_SEGMENT_KEY = "maxNumRecordsPerSegment";
+
+    public static final String ORIGINAL_DEFINED_SQL_KEY = "originalDefinedSQL";
+    public static final String WINDOW_START_MS_KEY = "windowStartMs";
+    public static final String WINDOW_END_MS_KEY = "windowEndMs";
+    public static final String SOURCE_TABLE_NAME_KEY = "sourceTableName";
+    public static final String PARTITION_FINGERPRINTS_KEY = "partitionFingerprints";
+
+    public static final String TASK_MODE_KEY = "taskMode";
+    public static final String TASK_MODE_APPEND = "APPEND";
+    public static final String TASK_MODE_OVERWRITE = "OVERWRITE";
+    public static final String TASK_MODE_DELETE = "DELETE";
+
+    public static final int DEFAULT_MAX_NUM_RECORDS_PER_SEGMENT = 4000;
+
+    /**
+     * Default LIMIT applied to the MV query when the user's {@code definedSQL} does not contain
+     * an explicit LIMIT clause.  Without this, the broker would apply its own default (typically 10),
+     * which silently truncates MV results.
+     */
+    public static final int DEFAULT_MV_QUERY_LIMIT = 1_000_000;
+  }
 }

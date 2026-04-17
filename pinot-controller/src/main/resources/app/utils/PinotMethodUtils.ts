@@ -366,6 +366,8 @@ const getAsObject = (str: SQLResult) => {
 const QUERY_STATS_COLUMNS = ['timeUsedMs',
   'numDocsScanned',
   'totalDocs',
+  'candidateMvs',
+  'hitMv',
   'numServersQueried',
   'numServersResponded',
   'numSegmentsQueried',
@@ -395,7 +397,10 @@ const extractQueryStatsFromResponse = (queryResponse) => {
 
   return {
     columns: QUERY_STATS_COLUMNS,
-    records: [[queryResponse.timeUsedMs, queryResponse.numDocsScanned, queryResponse.totalDocs, queryResponse.numServersQueried, queryResponse.numServersResponded,
+    records: [[queryResponse.timeUsedMs, queryResponse.numDocsScanned, queryResponse.totalDocs,
+      queryResponse.candidateMvs ? queryResponse.candidateMvs.join(', ') : '-',
+      queryResponse.hitMv ?? '-',
+      queryResponse.numServersQueried, queryResponse.numServersResponded,
       queryResponse.numSegmentsQueried, queryResponse.numSegmentsProcessed, queryResponse.numSegmentsMatched, queryResponse.numConsumingSegmentsQueried,
       queryResponse.numEntriesScannedInFilter, queryResponse.numEntriesScannedPostFilter, queryResponse.numGroupsLimitReached, queryResponse.numGroupsWarningLimitReached,
       partialResult ?? '-', queryResponse.minConsumingFreshnessTimeMs,

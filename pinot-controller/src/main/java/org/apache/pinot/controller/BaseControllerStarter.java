@@ -103,6 +103,7 @@ import org.apache.pinot.controller.helix.SegmentStatusChecker;
 import org.apache.pinot.controller.helix.core.PinotHelixResourceManager;
 import org.apache.pinot.controller.helix.core.cleanup.StaleInstancesCleanupTask;
 import org.apache.pinot.controller.helix.core.controllerjob.ControllerJobTypes;
+import org.apache.pinot.controller.helix.core.materializedview.MaterializedViewConsistencyManager;
 import org.apache.pinot.controller.helix.core.minion.PinotHelixTaskResourceManager;
 import org.apache.pinot.controller.helix.core.minion.PinotTaskManager;
 import org.apache.pinot.controller.helix.core.minion.TaskMetricsEmitter;
@@ -238,6 +239,7 @@ public abstract class BaseControllerStarter implements ServiceStartable {
   protected RebalancePreChecker _rebalancePreChecker;
   protected TableRebalanceManager _tableRebalanceManager;
   protected DefaultClusterConfigChangeHandler _clusterConfigChangeHandler;
+  protected MaterializedViewConsistencyManager _mvConsistencyManager;
 
   @Override
   public void init(PinotConfiguration pinotConfiguration)
@@ -604,6 +606,13 @@ public abstract class BaseControllerStarter implements ServiceStartable {
 
     // Initialize segment lifecycle event listeners
     PinotSegmentLifecycleEventListenerManager.getInstance().init(_helixParticipantManager);
+
+    // Initialize MV consistency manager for event-driven dirty marking
+    LOGGER.info("Initializing MaterializedView consistency manager");
+    _mvConsistencyManager = new MaterializedViewConsistencyManager();
+    _mvConsistencyManager.init(_helixResourceManager.getPropertyStore());
+    _helixResourceManager.registerMvConsistencyManager(_mvConsistencyManager);
+    _helixResourceManager.getSegmentDeletionManager().registerMvConsistencyManager(_mvConsistencyManager);
 
     LOGGER.info("Starting task resource manager");
     _helixTaskResourceManager =
@@ -1149,8 +1158,13 @@ public abstract class BaseControllerStarter implements ServiceStartable {
       LOGGER.info("Stopping Jersey admin API");
       _adminApp.stop();
 
-      LOGGER.info("Stopping resource manager");
-      _helixResourceManager.stop();
+    if (_mvConsistencyManager != null) {
+      LOGGER.info("Stopping MV consistency manager");
+      _mvConsistencyManager.stop();
+    }
+
+    LOGGER.info("Stopping resource manager");
+    _helixResourceManager.stop();
 
       LOGGER.info("Disconnecting helix participant zk manager");
       _helixParticipantManager.disconnect();

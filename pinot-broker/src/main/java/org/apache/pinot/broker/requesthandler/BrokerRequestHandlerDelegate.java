@@ -113,6 +113,11 @@ public class BrokerRequestHandlerDelegate implements BrokerRequestHandler {
 
     BaseBrokerRequestHandler requestHandler = _singleStageBrokerRequestHandler;
     if (QueryOptionsUtils.isUseMultistageEngine(sqlNodeAndOptions.getOptions())) {
+      if (QueryOptionsUtils.isUseMaterializedView(sqlNodeAndOptions.getOptions())) {
+        return new BrokerResponseNative(QueryErrorCode.QUERY_VALIDATION,
+            "Materialized view is not supported with the multi-stage query engine. "
+                + "Please remove either 'useMultistageEngine' or 'useMaterializedView' from query options.");
+      }
       if (_multiStageBrokerRequestHandler != null) {
         requestHandler = _multiStageBrokerRequestHandler;
       } else {

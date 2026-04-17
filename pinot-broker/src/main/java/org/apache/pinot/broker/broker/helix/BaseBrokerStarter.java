@@ -49,6 +49,8 @@ import org.apache.helix.zookeeper.datamodel.ZNRecord;
 import org.apache.pinot.broker.broker.AccessControlFactory;
 import org.apache.pinot.broker.broker.BrokerAdminApiApplication;
 import org.apache.pinot.broker.grpc.BrokerGrpcServer;
+import org.apache.pinot.broker.materializedview.MvQueryRewriteEngine;
+import org.apache.pinot.broker.materializedview.MvQueryRewriteEngineFactory;
 import org.apache.pinot.broker.queryquota.HelixExternalViewBasedQueryQuotaManager;
 import org.apache.pinot.broker.queryquota.QueryQuotaManager;
 import org.apache.pinot.broker.requesthandler.BaseSingleStageBrokerRequestHandler;
@@ -442,12 +444,17 @@ public abstract class BaseBrokerStarter implements ServiceStartable {
     BrokerRequestIdGenerator requestIdGenerator = new BrokerRequestIdGenerator();
     String brokerRequestHandlerType =
         _brokerConf.getProperty(Broker.BROKER_REQUEST_HANDLER_TYPE, Broker.DEFAULT_BROKER_REQUEST_HANDLER_TYPE);
+    MvQueryRewriteEngine mvQueryRewriteEngine = null;
+    if (_brokerConf.getProperty(Broker.CONFIG_OF_BROKER_QUERY_ENABLE_MATERIALIZED_VIEW_REWRITE,
+        Broker.DEFAULT_BROKER_QUERY_ENABLE_MATERIALIZED_VIEW_REWRITE)) {
+      mvQueryRewriteEngine = MvQueryRewriteEngineFactory.createDefault(_propertyStore);
+    }
     BaseSingleStageBrokerRequestHandler singleStageBrokerRequestHandler;
     if (brokerRequestHandlerType.equalsIgnoreCase(Broker.GRPC_BROKER_REQUEST_HANDLER_TYPE)) {
       singleStageBrokerRequestHandler =
           new GrpcBrokerRequestHandler(_brokerConf, brokerId, requestIdGenerator, _routingManager,
               _accessControlFactory, _queryQuotaManager, _tableCache, _failureDetector, _threadAccountant,
-              multiClusterRoutingContext);
+              multiClusterRoutingContext, mvQueryRewriteEngine);
     } else {
       // Default request handler type, i.e. netty
       NettyConfig nettyDefaults = NettyConfig.extractNettyConfig(_brokerConf, Broker.BROKER_NETTY_PREFIX);
@@ -472,8 +479,10 @@ public abstract class BaseBrokerStarter implements ServiceStartable {
       singleStageBrokerRequestHandler =
           createSingleStageBrokerRequestHandler(_brokerConf, brokerId, requestIdGenerator, _routingManager,
               _accessControlFactory, _queryQuotaManager, _tableCache, nettyDefaults, tlsDefaults,
-              _serverRoutingStatsManager, _failureDetector, _threadAccountant, multiClusterRoutingContext);
+              _serverRoutingStatsManager, _failureDetector, _threadAccountant, multiClusterRoutingContext,
+              mvQueryRewriteEngine);
     }
+
     MultiStageBrokerRequestHandler multiStageBrokerRequestHandler = null;
     if (_brokerConf.getProperty(Helix.CONFIG_OF_MULTI_STAGE_ENGINE_ENABLED, Helix.DEFAULT_MULTI_STAGE_ENGINE_ENABLED)) {
       _multiStageQueryThrottler = new MultiStageQueryThrottler(_brokerConf);

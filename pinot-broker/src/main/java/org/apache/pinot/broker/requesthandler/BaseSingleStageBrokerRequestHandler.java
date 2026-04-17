@@ -54,6 +54,10 @@ import org.apache.hc.client5.http.io.HttpClientConnectionManager;
 import org.apache.hc.core5.http.io.entity.EntityUtils;
 import org.apache.pinot.broker.api.AccessControl;
 import org.apache.pinot.broker.broker.AccessControlFactory;
+import org.apache.pinot.broker.materializedview.ExecutionMode;
+import org.apache.pinot.broker.materializedview.MvQueryRewriteEngine;
+import org.apache.pinot.broker.materializedview.MvRewritePlan;
+import org.apache.pinot.broker.materializedview.MvRewriteResult;
 import org.apache.pinot.broker.querylog.QueryLogger;
 import org.apache.pinot.broker.queryquota.QueryQuotaManager;
 import org.apache.pinot.common.config.provider.TableCache;
@@ -65,6 +69,7 @@ import org.apache.pinot.common.metrics.BrokerMeter;
 import org.apache.pinot.common.metrics.BrokerMetrics;
 import org.apache.pinot.common.metrics.BrokerQueryPhase;
 import org.apache.pinot.common.metrics.BrokerTimer;
+import org.apache.pinot.common.minion.MvDefinitionMetadata;
 import org.apache.pinot.common.request.BrokerRequest;
 import org.apache.pinot.common.request.DataSource;
 import org.apache.pinot.common.request.Expression;
@@ -90,6 +95,7 @@ import org.apache.pinot.core.query.reduce.BaseGapfillProcessor;
 import org.apache.pinot.core.query.reduce.GapfillProcessorFactory;
 import org.apache.pinot.core.query.request.context.QueryContext;
 import org.apache.pinot.core.query.request.context.utils.QueryContextConverterUtils;
+import org.apache.pinot.core.routing.ImplicitHybridTableRouteInfo;
 import org.apache.pinot.core.routing.ImplicitHybridTableRouteProvider;
 import org.apache.pinot.core.routing.LogicalTableRouteProvider;
 import org.apache.pinot.core.routing.MultiClusterRoutingContext;
@@ -108,6 +114,8 @@ import org.apache.pinot.spi.config.table.FieldConfig;
 import org.apache.pinot.spi.config.table.QueryConfig;
 import org.apache.pinot.spi.config.table.RoutingConfig;
 import org.apache.pinot.spi.config.table.TableConfig;
+import org.apache.pinot.spi.data.DateTimeFieldSpec;
+import org.apache.pinot.spi.data.DateTimeFormatSpec;
 import org.apache.pinot.spi.data.DimensionFieldSpec;
 import org.apache.pinot.spi.data.LogicalTableConfig;
 import org.apache.pinot.spi.data.Schema;
@@ -164,6 +172,8 @@ public abstract class BaseSingleStageBrokerRequestHandler extends BaseBrokerRequ
   );
 
   protected final QueryOptimizer _queryOptimizer = new QueryOptimizer();
+  @Nullable
+  protected final MvQueryRewriteEngine _mvQueryRewriteEngine;
   protected final boolean _disableGroovy;
   protected final boolean _useApproximateFunction;
   protected final int _defaultHllLog2m;
@@ -185,9 +195,11 @@ public abstract class BaseSingleStageBrokerRequestHandler extends BaseBrokerRequ
   public BaseSingleStageBrokerRequestHandler(PinotConfiguration config, String brokerId,
       BrokerRequestIdGenerator requestIdGenerator, RoutingManager routingManager,
       AccessControlFactory accessControlFactory, QueryQuotaManager queryQuotaManager, TableCache tableCache,
-      ThreadAccountant threadAccountant, MultiClusterRoutingContext multiClusterRoutingContext) {
+      ThreadAccountant threadAccountant, MultiClusterRoutingContext multiClusterRoutingContext,
+      @Nullable MvQueryRewriteEngine mvQueryRewriteEngine) {
     super(config, brokerId, requestIdGenerator, routingManager, accessControlFactory, queryQuotaManager, tableCache,
         threadAccountant, multiClusterRoutingContext);
+    _mvQueryRewriteEngine = mvQueryRewriteEngine;
     _disableGroovy = _config.getProperty(Broker.DISABLE_GROOVY, Broker.DEFAULT_DISABLE_GROOVY);
     _useApproximateFunction = _config.getProperty(Broker.USE_APPROXIMATE_FUNCTION, false);
     _defaultHllLog2m = _config.getProperty(CommonConstants.Helix.DEFAULT_HYPERLOGLOG_LOG2M_KEY,
@@ -384,15 +396,41 @@ public abstract class BaseSingleStageBrokerRequestHandler extends BaseBrokerRequ
     final String _tableName;
     final String _rawTableName;
     final BrokerResponse _errorOrLiteralOnlyBrokerResponse;
+    @Nullable
+    final MvRewriteResult _mvRewriteResult;
+
+    // When MV split is active (MV hit + latestPartitionTime > 0), these fields hold the MV-side
+    // rewritten query while _serverPinotQuery/_tableName remain pointing at the base table.
+    // When null, either no MV matched or the MV has not been materialized yet.
+    @Nullable
+    final PinotQuery _mvServerPinotQuery;
+    @Nullable
+    final String _mvTableName;
+    @Nullable
+    final String _mvRawTableName;
+    @Nullable
+    final Schema _mvSchema;
 
     public CompileResult(PinotQuery pinotQuery, PinotQuery serverPinotQuery, Schema schema, String tableName,
-        String rawTableName) {
+        String rawTableName, @Nullable MvRewriteResult mvRewriteResult) {
+      this(pinotQuery, serverPinotQuery, schema, tableName, rawTableName, mvRewriteResult, null, null, null, null);
+    }
+
+    public CompileResult(PinotQuery pinotQuery, PinotQuery serverPinotQuery, Schema schema, String tableName,
+        String rawTableName, @Nullable MvRewriteResult mvRewriteResult,
+        @Nullable PinotQuery mvServerPinotQuery, @Nullable String mvTableName,
+        @Nullable String mvRawTableName, @Nullable Schema mvSchema) {
       _pinotQuery = pinotQuery;
       _serverPinotQuery = serverPinotQuery;
       _schema = schema;
       _tableName = tableName;
       _rawTableName = rawTableName;
       _errorOrLiteralOnlyBrokerResponse = null;
+      _mvRewriteResult = mvRewriteResult;
+      _mvServerPinotQuery = mvServerPinotQuery;
+      _mvTableName = mvTableName;
+      _mvRawTableName = mvRawTableName;
+      _mvSchema = mvSchema;
     }
 
     public CompileResult(BrokerResponse errorOrLiteralOnlyBrokerResponse) {
@@ -402,6 +440,17 @@ public abstract class BaseSingleStageBrokerRequestHandler extends BaseBrokerRequ
       _tableName = null;
       _rawTableName = null;
       _errorOrLiteralOnlyBrokerResponse = errorOrLiteralOnlyBrokerResponse;
+      _mvRewriteResult = null;
+      _mvServerPinotQuery = null;
+      _mvTableName = null;
+      _mvRawTableName = null;
+      _mvSchema = null;
+    }
+
+    /// Returns {@code true} when the query should be split into a base-table query and
+    /// an MV query, with results merged at reduce time.
+    boolean isMvSplit() {
+      return _mvServerPinotQuery != null;
     }
   }
 
@@ -817,6 +866,34 @@ public abstract class BaseSingleStageBrokerRequestHandler extends BaseBrokerRequ
     // Execute the query
     // TODO: Replace ServerStats with ServerRoutingStatsEntry.
     ServerStats serverStats = new ServerStats();
+
+    // ---------- MV Split: issue parallel base + MV queries and merge results ----------
+    if (compileResult.isMvSplit()) {
+      BrokerResponseNative mvSplitResponse = handleMvSplitExecution(requestId, compileResult, brokerRequest,
+          routeInfo, routeProvider, selectedRoutingManager, remainingTimeMs,
+          serverStats, requestContext);
+      mvSplitResponse.setTablesQueried(Set.of(rawTableName));
+      MvRewriteResult mvRR = compileResult._mvRewriteResult;
+      if (mvRR != null) {
+        mvSplitResponse.setCandidateMvs(mvRR.getCandidateNames());
+        mvSplitResponse.setHitMv(mvRR.getHitMvName());
+      }
+      for (QueryProcessingException errorMsg : errorMsgs) {
+        mvSplitResponse.addException(errorMsg);
+      }
+      mvSplitResponse.setNumSegmentsPrunedByBroker(numPrunedSegmentsTotal);
+      fillEmptyResponseSchema(pinotQuery, mvSplitResponse, schema, database, query);
+      long totalTimeMs = System.currentTimeMillis() - requestContext.getRequestArrivalTimeMillis();
+      mvSplitResponse.setTimeUsedMs(totalTimeMs);
+      augmentStatistics(requestContext, mvSplitResponse);
+      mvSplitResponse.setRLSFiltersApplied(rlsFiltersApplied.get());
+      _queryLogger.logQueryCompleted(
+          new QueryLogger.QueryLogParams(requestContext, tableName, mvSplitResponse,
+              QueryLogger.QueryLogParams.QueryEngine.SINGLE_STAGE, requesterIdentity, serverStats),
+          queryWasLogged);
+      return mvSplitResponse;
+    }
+
     // TODO: Handle broker specific operations for explain plan queries such as:
     //       - Alias handling
     //       - Compile time function invocation
@@ -857,6 +934,11 @@ public abstract class BaseSingleStageBrokerRequestHandler extends BaseBrokerRequ
           remainingTimeMs, serverStats, requestContext);
     }
     brokerResponse.setTablesQueried(Set.of(rawTableName));
+    MvRewriteResult mvRewriteResult = compileResult._mvRewriteResult;
+    if (mvRewriteResult != null) {
+      brokerResponse.setCandidateMvs(mvRewriteResult.getCandidateNames());
+      brokerResponse.setHitMv(mvRewriteResult.getHitMvName());
+    }
     brokerResponse.setPools(Stream.concat(
             offlineExecutionServers != null ? offlineExecutionServers.stream() : Stream.empty(),
             realtimeExecutionServers != null ? realtimeExecutionServers.stream() : Stream.empty())
@@ -1075,9 +1157,47 @@ public abstract class BaseSingleStageBrokerRequestHandler extends BaseBrokerRequ
     if (schema != null) {
       handleAggFunctionMVOverride(serverPinotQuery, schema);
     }
+
+    if (_mvQueryRewriteEngine == null && QueryOptionsUtils.isUseMaterializedView(serverPinotQuery.getQueryOptions())) {
+      LOGGER.info("useMaterializedView requested but MV rewrite is not enabled on broker for request {}: {}", requestId,
+          query);
+      requestContext.setErrorCode(QueryErrorCode.QUERY_VALIDATION);
+      return new CompileResult(new BrokerResponseNative(QueryErrorCode.QUERY_VALIDATION,
+          "Materialized view query rewrite is not enabled on this broker. Set broker config "
+              + Broker.CONFIG_OF_BROKER_QUERY_ENABLE_MATERIALIZED_VIEW_REWRITE + " to true."));
+    }
+
+    MvRewriteResult mvRewriteResult = null;
+    PinotQuery mvServerPinotQuery = null;
+    String mvTableName = null;
+    String mvRawTableName = null;
+    Schema mvSchema = null;
+
+    if (_mvQueryRewriteEngine != null
+        && QueryOptionsUtils.isUseMaterializedView(serverPinotQuery.getQueryOptions())) {
+      mvRewriteResult = _mvQueryRewriteEngine.tryRewrite(serverPinotQuery, rawTableName);
+      if (mvRewriteResult != null && mvRewriteResult.isHit()) {
+        MvRewritePlan plan = mvRewriteResult.getPlan();
+
+        if (plan.getExecMode() == ExecutionMode.SPLIT_REWRITE) {
+          mvServerPinotQuery = plan.getMvQuery();
+          mvTableName = plan.getMvTableNameWithType();
+          mvRawTableName = TableNameBuilder.extractRawTableName(mvTableName);
+          mvSchema = _tableCache.getSchema(mvRawTableName);
+        } else {
+          serverPinotQuery = plan.getMvQuery();
+          pinotQuery = serverPinotQuery;
+          tableName = plan.getMvTableNameWithType();
+          rawTableName = TableNameBuilder.extractRawTableName(tableName);
+          schema = _tableCache.getSchema(rawTableName);
+        }
+      }
+    }
+
     _queryOptimizer.optimize(serverPinotQuery, schema);
 
-    return new CompileResult(pinotQuery, serverPinotQuery, schema, tableName, rawTableName);
+    return new CompileResult(pinotQuery, serverPinotQuery, schema, tableName, rawTableName,
+        mvRewriteResult, mvServerPinotQuery, mvTableName, mvRawTableName, mvSchema);
   }
 
   private void throwAccessDeniedError(long requestId, String query, RequestContext requestContext, String tableName,
@@ -2116,7 +2236,168 @@ public abstract class BaseSingleStageBrokerRequestHandler extends BaseBrokerRequ
   }
 
   /**
+   * Handles the MV-split execution path: builds independent routing for both the base table
+   * (with a complementary time filter for recent data) and the MV table, then delegates to
+   * {@link #processMvSplitBrokerRequest} for dual scatter-gather and reduce.
+   */
+  private BrokerResponseNative handleMvSplitExecution(long requestId, CompileResult compileResult,
+      BrokerRequest originalBrokerRequest,
+      TableRouteInfo baseRouteInfo, TableRouteProvider routeProvider, RoutingManager routingManager,
+      long remainingTimeMs, ServerStats serverStats, RequestContext requestContext)
+      throws Exception {
+    MvRewritePlan plan = compileResult._mvRewriteResult.getPlan();
+    long boundaryTimeMs = plan.getCoverageUpperMs();
+
+    // --- 1. Attach time boundary filter to the base table query (ts >= boundary) ---
+    MvDefinitionMetadata.MvSplitSpec splitSpec = plan.getSplitSpec();
+    Preconditions.checkNotNull(splitSpec,
+        "MvSplitSpec must be set when execMode == SPLIT_REWRITE for MV: %s", plan.getMvTableNameWithType());
+    String baseTimeColumn = splitSpec.getSourceTimeColumn();
+
+    // Convert the millisecond boundary to the base table's time column format.
+    // The coverageUpperMs is always in epoch millis, but the time column may use a
+    // different granularity (e.g. EPOCH|DAYS stored as INT). Without this conversion the
+    // filter value overflows the column type.
+    Schema baseSchema = compileResult._schema;
+    DateTimeFieldSpec timeFieldSpec = baseSchema.getSpecForTimeColumn(baseTimeColumn);
+    Preconditions.checkNotNull(timeFieldSpec,
+        "Time column '%s' not found in schema for table '%s'", baseTimeColumn, compileResult._tableName);
+    DateTimeFormatSpec timeFormatSpec = timeFieldSpec.getFormatSpec();
+    String convertedTimeValue = timeFormatSpec.fromMillisToFormat(boundaryTimeMs);
+    TimeBoundaryInfo baseBoundary = new TimeBoundaryInfo(baseTimeColumn, convertedTimeValue);
+
+    // Deep-copy the base PinotQuery to avoid mutating the original.
+    // MV split requires all servers to return intermediate results so
+    // that the broker can merge DataTables from both the base table and the MV correctly.
+    //
+    // LIMIT/OFFSET semantics: both sub-queries (base + MV) inherit the user's original
+    // LIMIT and OFFSET unchanged. This is correct because:
+    //  - For ORDER BY queries, each server already returns (offset + limit) rows
+    //    (see SelectionOrderByOperator._numRowsToKeep). The broker reducer
+    //    (SelectionOperatorService) merges all results, keeps top (offset + limit),
+    //    then skips the first offset rows.
+    //  - For non-ORDER BY queries, OFFSET is not applied at the server level
+    //    (SelectionOnlyOperator uses limit only), and the reducer ignores offset.
+    //  - For GROUP BY queries, OFFSET is not supported by GroupByDataTableReducer.
+    // The final reduce uses originalBrokerRequest (which retains the user's LIMIT/OFFSET),
+    // so the offset is correctly applied during the merge phase, not at the sub-query level.
+    PinotQuery basePinotQuery = compileResult._serverPinotQuery.deepCopy();
+    basePinotQuery.getQueryOptions().remove(QueryOptionKey.SERVER_RETURN_FINAL_RESULT);
+    basePinotQuery.getQueryOptions().remove(QueryOptionKey.SERVER_RETURN_FINAL_RESULT_KEY_UNPARTITIONED);
+    // Use GREATER_THAN_OR_EQUAL (>=) to cover ts == boundaryTimeMs, since the MV
+    // materializes ts < boundaryTimeMs (exclusive upper bound). This fixes the
+    // previous bug where GREATER_THAN (>) left a gap at the boundary.
+    attachMvSplitTimeBoundary(basePinotQuery, baseBoundary); // ts >= boundary
+    _queryOptimizer.optimize(basePinotQuery, compileResult._schema);
+    BrokerRequest baseBrokerRequest = CalciteSqlCompiler.convertToBrokerRequest(basePinotQuery);
+
+    // Route the base table query through the standard hybrid/offline/realtime path.
+    // The base table may itself be hybrid, so we prepare offline + realtime requests as needed.
+    // When the base table is hybrid, prepareBaseTableRoute creates separate offline and
+    // realtime copies, each carrying both the MV split boundary (ts >= coverageUpperMs) and
+    // the hybrid time boundary (offline: ts <= hybridBoundary, realtime: ts > hybridBoundary).
+    // If coverageUpperMs exceeds the hybrid boundary, the offline filter becomes an empty
+    // range (ts >= coverageUpperMs AND ts <= hybridBoundary where coverageUpperMs > hybridBoundary).
+    // The optimizer simplifies this to FALSE, and the always-false check below prunes the
+    // offline request to avoid a wasted RPC — mirroring the main doHandleRequest flow.
+    prepareBaseTableRoute(baseBrokerRequest, baseRouteInfo, compileResult._schema);
+
+    BrokerRequest baseOfflineBrokerRequest = baseRouteInfo.getOfflineBrokerRequest();
+    BrokerRequest baseRealtimeBrokerRequest = baseRouteInfo.getRealtimeBrokerRequest();
+    if (baseOfflineBrokerRequest != null && isFilterAlwaysFalse(baseOfflineBrokerRequest.getPinotQuery())) {
+      baseOfflineBrokerRequest = null;
+    }
+    if (baseRealtimeBrokerRequest != null && isFilterAlwaysFalse(baseRealtimeBrokerRequest.getPinotQuery())) {
+      baseRealtimeBrokerRequest = null;
+    }
+    ((ImplicitHybridTableRouteInfo) baseRouteInfo).setOfflineBrokerRequest(baseOfflineBrokerRequest);
+    ((ImplicitHybridTableRouteInfo) baseRouteInfo).setRealtimeBrokerRequest(baseRealtimeBrokerRequest);
+
+    routeProvider.calculateRoutes(baseRouteInfo, routingManager,
+        baseOfflineBrokerRequest, baseRealtimeBrokerRequest, requestId);
+
+    // --- 2. Build routing for the MV table query ---
+    PinotQuery mvPinotQuery = compileResult._mvServerPinotQuery.deepCopy();
+    mvPinotQuery.getQueryOptions().remove(QueryOptionKey.SERVER_RETURN_FINAL_RESULT);
+    mvPinotQuery.getQueryOptions().remove(QueryOptionKey.SERVER_RETURN_FINAL_RESULT_KEY_UNPARTITIONED);
+    _queryOptimizer.optimize(mvPinotQuery, compileResult._mvSchema);
+
+    TableRouteInfo mvRouteInfo =
+        routeProvider.getTableRouteInfo(compileResult._mvTableName, _tableCache, routingManager);
+    BrokerRequest mvBrokerRequest = CalciteSqlCompiler.convertToBrokerRequest(mvPinotQuery);
+
+    // MV tables are typically OFFLINE, so prepare the offline route for the MV query.
+    BrokerRequest mvOfflineBrokerRequest = mvBrokerRequest;
+    routeProvider.calculateRoutes(mvRouteInfo, routingManager, mvOfflineBrokerRequest, null, requestId);
+
+    // --- 3. Dispatch to dual scatter-gather + reduce ---
+    // The originalBrokerRequest may carry SERVER_RETURN_FINAL_RESULT=true set by the
+    // outer doHandleRequest flow (when numServers == 1). Since processMvSplitBrokerRequest
+    // passes this request to BrokerReduceService as the serverBrokerRequest, the reducer
+    // would build a QueryContext with isServerReturnFinalResult() == true and attempt to
+    // cast intermediate objects (e.g. HyperLogLog) to Comparable, causing a ClassCastException.
+    // Remove the flag so the reducer uses the intermediate-result merge path.
+    originalBrokerRequest.getPinotQuery().getQueryOptions()
+        .remove(QueryOptionKey.SERVER_RETURN_FINAL_RESULT);
+    originalBrokerRequest.getPinotQuery().getQueryOptions()
+        .remove(QueryOptionKey.SERVER_RETURN_FINAL_RESULT_KEY_UNPARTITIONED);
+
+    String baseRouteType = baseRouteInfo.isHybrid() ? "HYBRID" : (baseRouteInfo.isOffline() ? "OFFLINE" : "REALTIME");
+    LOGGER.info("MV split execution for request {}: baseTable={} ({}), mvTable={}, boundaryTimeMs={}, "
+            + "convertedBoundary={} (column={}), baseOffline={}, baseRealtime={}",
+        requestId, compileResult._tableName, baseRouteType, compileResult._mvTableName, boundaryTimeMs,
+        convertedTimeValue, baseTimeColumn,
+        baseRouteInfo.getOfflineBrokerRequest() != null, baseRouteInfo.getRealtimeBrokerRequest() != null);
+
+    return processMvSplitBrokerRequest(requestId, originalBrokerRequest,
+        baseRouteInfo, mvRouteInfo, remainingTimeMs, serverStats, requestContext);
+  }
+
+  /**
+   * Prepares the offline/realtime broker requests for the base table route based on
+   * whether the base table is hybrid, offline-only, or realtime-only.
+   * This mirrors the logic in the main doHandleRequest flow but operates on a pre-existing
+   * routeInfo for the base table.
+   */
+  private void prepareBaseTableRoute(BrokerRequest baseBrokerRequest, TableRouteInfo baseRouteInfo, Schema schema) {
+    String offlineTableName = baseRouteInfo.getOfflineTableName();
+    String realtimeTableName = baseRouteInfo.getRealtimeTableName();
+    TimeBoundaryInfo timeBoundaryInfo = baseRouteInfo.getTimeBoundaryInfo();
+
+    if (baseRouteInfo.isHybrid()) {
+      PinotQuery basePinotQuery = baseBrokerRequest.getPinotQuery();
+
+      PinotQuery offlinePinotQuery = basePinotQuery.deepCopy();
+      offlinePinotQuery.getDataSource().setTableName(offlineTableName);
+      if (timeBoundaryInfo != null) {
+        attachTimeBoundary(offlinePinotQuery, timeBoundaryInfo, true);
+      }
+      _queryOptimizer.optimize(offlinePinotQuery, schema);
+      BrokerRequest offlineBrokerRequest = CalciteSqlCompiler.convertToBrokerRequest(offlinePinotQuery);
+
+      PinotQuery realtimePinotQuery = basePinotQuery.deepCopy();
+      realtimePinotQuery.getDataSource().setTableName(realtimeTableName);
+      if (timeBoundaryInfo != null) {
+        attachTimeBoundary(realtimePinotQuery, timeBoundaryInfo, false);
+      }
+      _queryOptimizer.optimize(realtimePinotQuery, schema);
+      BrokerRequest realtimeBrokerRequest = CalciteSqlCompiler.convertToBrokerRequest(realtimePinotQuery);
+
+      ((ImplicitHybridTableRouteInfo) baseRouteInfo).setOfflineBrokerRequest(offlineBrokerRequest);
+      ((ImplicitHybridTableRouteInfo) baseRouteInfo).setRealtimeBrokerRequest(realtimeBrokerRequest);
+    } else if (baseRouteInfo.isOffline()) {
+      setTableName(baseBrokerRequest, offlineTableName);
+      ((ImplicitHybridTableRouteInfo) baseRouteInfo).setOfflineBrokerRequest(baseBrokerRequest);
+    } else {
+      setTableName(baseBrokerRequest, realtimeTableName);
+      ((ImplicitHybridTableRouteInfo) baseRouteInfo).setRealtimeBrokerRequest(baseBrokerRequest);
+    }
+  }
+
+  /**
    * Helper method to attach the time boundary to the given PinotQuery.
+   * Used for standard hybrid table offline/realtime split where offline has
+   * {@code ts <= boundary} and realtime has {@code ts > boundary}.
    */
   private static void attachTimeBoundary(PinotQuery pinotQuery, TimeBoundaryInfo timeBoundaryInfo,
       boolean isOfflineRequest) {
@@ -2137,12 +2418,56 @@ public abstract class BaseSingleStageBrokerRequestHandler extends BaseBrokerRequ
   }
 
   /**
+   * Attaches a {@code ts >= boundary} filter for MV split mode. The MV materializes
+   * data with {@code ts < boundary} (exclusive upper bound), so the base table must
+   * cover {@code ts >= boundary} to avoid a gap at the boundary.
+   */
+  private static void attachMvSplitTimeBoundary(PinotQuery pinotQuery, TimeBoundaryInfo timeBoundaryInfo) {
+    String timeColumn = timeBoundaryInfo.getTimeColumn();
+    String timeValue = timeBoundaryInfo.getTimeValue();
+    Expression timeFilterExpression = RequestUtils.getFunctionExpression(
+        FilterKind.GREATER_THAN_OR_EQUAL.name(),
+        RequestUtils.getIdentifierExpression(timeColumn),
+        RequestUtils.getLiteralExpression(timeValue));
+
+    Expression filterExpression = pinotQuery.getFilterExpression();
+    if (filterExpression != null) {
+      pinotQuery.setFilterExpression(
+          RequestUtils.getFunctionExpression(FilterKind.AND.name(), filterExpression, timeFilterExpression));
+    } else {
+      pinotQuery.setFilterExpression(timeFilterExpression);
+    }
+  }
+
+  /**
    * Processes the optimized broker requests for both OFFLINE and REALTIME table.
    * TODO: Directly take PinotQuery
    */
   protected abstract BrokerResponseNative processBrokerRequest(long requestId, BrokerRequest originalBrokerRequest,
       BrokerRequest serverBrokerRequest, TableRouteInfo route, long timeoutMs,
       ServerStats serverStats, RequestContext requestContext)
+      throws Exception;
+
+  /**
+   * Processes an MV-split query by issuing two independent scatter-gather requests — one to the
+   * base table (for recent data beyond the MV boundary) and one to the MV table (for historical
+   * data up to the boundary) — then merging all returned {@code DataTable}s into a single
+   * {@code dataTableMap} and reducing with the original user query's {@code BrokerRequest}.
+   *
+   * <p>Subclasses must implement this to perform the actual network I/O. The default
+   * {@link SingleConnectionBrokerRequestHandler} sends both requests via the {@code QueryRouter}.
+   *
+   * @param requestId        unique request identifier
+   * @param originalBrokerRequest the user's original query (used as the reduce key)
+   * @param baseRoute        routing info for the base table query (ts &gt; boundary)
+   * @param mvRoute          routing info for the MV table query
+   * @param timeoutMs        remaining timeout in milliseconds
+   * @param serverStats      collector for server-side stats
+   * @param requestContext   request-level context for metrics and tracing
+   */
+  protected abstract BrokerResponseNative processMvSplitBrokerRequest(long requestId,
+      BrokerRequest originalBrokerRequest, TableRouteInfo baseRoute, TableRouteInfo mvRoute,
+      long timeoutMs, ServerStats serverStats, RequestContext requestContext)
       throws Exception;
 
   private String getGlobalQueryId(long requestId) {

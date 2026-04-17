@@ -46,9 +46,11 @@ import org.apache.helix.model.IdealState;
 import org.apache.helix.store.zk.ZkHelixPropertyStore;
 import org.apache.helix.zookeeper.datamodel.ZNRecord;
 import org.apache.pinot.common.metadata.ZKMetadataProvider;
+import org.apache.pinot.common.metadata.segment.SegmentZKMetadata;
 import org.apache.pinot.common.utils.TarCompressionUtils;
 import org.apache.pinot.common.utils.URIUtils;
 import org.apache.pinot.controller.LeadControllerManager;
+import org.apache.pinot.controller.helix.core.materializedview.MaterializedViewConsistencyManager;
 import org.apache.pinot.core.segment.processing.lifecycle.PinotSegmentLifecycleEventListenerManager;
 import org.apache.pinot.core.segment.processing.lifecycle.impl.SegmentDeletionEventDetails;
 import org.apache.pinot.segment.local.utils.SegmentPushUtils;
@@ -93,6 +95,7 @@ public class SegmentDeletionManager {
   private final HelixAdmin _helixAdmin;
   private final ZkHelixPropertyStore<ZNRecord> _propertyStore;
   private final long _defaultDeletedSegmentsRetentionMs;
+  private volatile MaterializedViewConsistencyManager _mvConsistencyManager;
 
   public SegmentDeletionManager(String dataDir, HelixAdmin helixAdmin, String helixClusterName,
       ZkHelixPropertyStore<ZNRecord> propertyStore, int deletedSegmentsRetentionInDays) {
@@ -114,6 +117,38 @@ public class SegmentDeletionManager {
 
   public void stop() {
     _executorService.shutdownNow();
+  }
+
+  public void registerMvConsistencyManager(MaterializedViewConsistencyManager mvConsistencyManager) {
+    _mvConsistencyManager = mvConsistencyManager;
+  }
+
+  private void notifyMvConsistencyManager(String tableName, List<String> segmentsToDelete) {
+    MaterializedViewConsistencyManager mgr = _mvConsistencyManager;
+    if (mgr == null || segmentsToDelete.isEmpty()) {
+      return;
+    }
+    try {
+      long minStart = Long.MAX_VALUE;
+      long maxEnd = Long.MIN_VALUE;
+      for (String segmentId : segmentsToDelete) {
+        SegmentZKMetadata meta = ZKMetadataProvider.getSegmentZKMetadata(_propertyStore, tableName, segmentId);
+        if (meta != null) {
+          long startMs = meta.getStartTimeMs();
+          long endMs = meta.getEndTimeMs();
+          if (startMs > 0 && endMs > 0) {
+            minStart = Math.min(minStart, startMs);
+            maxEnd = Math.max(maxEnd, endMs);
+          }
+        }
+      }
+      if (minStart != Long.MAX_VALUE && maxEnd != Long.MIN_VALUE) {
+        String rawTableName = TableNameBuilder.extractRawTableName(tableName);
+        mgr.onBaseTableDataChange(rawTableName, minStart, maxEnd);
+      }
+    } catch (Exception e) {
+      LOGGER.warn("Failed to notify MV consistency manager for segment deletion on table: {}", tableName, e);
+    }
   }
 
   public void deleteSegments(String tableName, Collection<String> segmentIds) {
@@ -176,6 +211,9 @@ public class SegmentDeletionManager {
         String segmentPropertyStorePath = ZKMetadataProvider.constructPropertyStorePathForSegment(tableName, segmentId);
         propStorePathList.add(segmentPropertyStorePath);
       }
+
+      // Capture segment time ranges before ZK metadata is removed (for MV dirty marking)
+      notifyMvConsistencyManager(tableName, segmentsToDelete);
 
       // Notify all active listeners here
       PinotSegmentLifecycleEventListenerManager.getInstance()

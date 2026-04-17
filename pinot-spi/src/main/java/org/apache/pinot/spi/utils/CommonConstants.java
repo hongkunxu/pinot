@@ -367,6 +367,13 @@ public class CommonConstants {
         "pinot.broker.query.log.logBeforeProcessing";
     public static final boolean DEFAULT_BROKER_QUERY_LOG_BEFORE_PROCESSING = true;
     public static final String CONFIG_OF_BROKER_QUERY_ENABLE_NULL_HANDLING = "pinot.broker.query.enable.null.handling";
+    /**
+     * When true, the broker initializes materialized view metadata cache and query rewrite engine.
+     * When false (default), MV rewrite is disabled regardless of per-query {@code useMaterializedView} option.
+     */
+    public static final String CONFIG_OF_BROKER_QUERY_ENABLE_MATERIALIZED_VIEW_REWRITE =
+        "pinot.broker.query.enable.materialized.view.rewrite";
+    public static final boolean DEFAULT_BROKER_QUERY_ENABLE_MATERIALIZED_VIEW_REWRITE = false;
     /// Provide broker level default for query option [Request.QueryOptionKey#REGEX_DICT_SIZE_THRESHOLD]
     public static final String CONFIG_OF_BROKER_QUERY_REGEX_DICT_SIZE_THRESHOLD =
         "pinot.broker.query.regex.dict.size.threshold";
@@ -725,6 +732,7 @@ public class CommonConstants {
         public static final String USE_FIXED_REPLICA = "useFixedReplica";
         public static final String EXPLAIN_PLAN_VERBOSE = "explainPlanVerbose";
         public static final String USE_MULTISTAGE_ENGINE = "useMultistageEngine";
+        public static final String USE_MATERIALIZED_VIEW = "useMaterializedView";
         public static final String INFER_PARTITION_HINT = "inferPartitionHint";
         public static final String ENABLE_NULL_HANDLING = "enableNullHandling";
         public static final String APPLICATION_NAME = "applicationName";

@@ -291,6 +291,11 @@ public class QueryOptionsUtils {
     return Boolean.parseBoolean(queryOptions.get(QueryOptionKey.USE_MULTISTAGE_ENGINE));
   }
 
+  public static boolean isUseMaterializedView(@Nullable Map<String, String> queryOptions) {
+    return queryOptions != null
+        && Boolean.parseBoolean(queryOptions.get(QueryOptionKey.USE_MATERIALIZED_VIEW));
+  }
+
   public static boolean isGetCursor(Map<String, String> queryOptions) {
     return Boolean.parseBoolean(queryOptions.get(QueryOptionKey.GET_CURSOR));
   }

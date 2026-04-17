@@ -248,7 +248,7 @@ public class BaseSingleStageBrokerRequestHandlerTest {
     BaseSingleStageBrokerRequestHandler requestHandler =
         new BaseSingleStageBrokerRequestHandler(config, "testBrokerId", new BrokerRequestIdGenerator(), routingManager,
             new AllowAllAccessControlFactory(), queryQuotaManager, tableCache,
-            ThreadAccountantUtils.getNoOpAccountant(), null) {
+            ThreadAccountantUtils.getNoOpAccountant(), null, null) {
           @Override
           public void start() {
           }
@@ -265,6 +265,14 @@ public class BaseSingleStageBrokerRequestHandlerTest {
             testRequestId[0] = requestId;
             latch.await();
             return null;
+          }
+
+          @Override
+          protected BrokerResponseNative processMvSplitBrokerRequest(long requestId,
+              BrokerRequest originalBrokerRequest, TableRouteInfo baseRoute, TableRouteInfo mvRoute,
+              long timeoutMs, ServerStats serverStats, RequestContext requestContext)
+              throws Exception {
+            throw new UnsupportedOperationException("Not implemented in test");
           }
         };
     CompletableFuture.runAsync(() -> {
@@ -378,7 +386,7 @@ public class BaseSingleStageBrokerRequestHandlerTest {
 
     return new BaseSingleStageBrokerRequestHandler(config, "testBrokerId", new BrokerRequestIdGenerator(),
         routingManager, new AllowAllAccessControlFactory(), queryQuotaManager, tableCache,
-        ThreadAccountantUtils.getNoOpAccountant(), null) {
+        ThreadAccountantUtils.getNoOpAccountant(), null, null) {
       @Override
       public void start() {
       }
@@ -393,6 +401,14 @@ public class BaseSingleStageBrokerRequestHandlerTest {
           RequestContext requestContext) {
         capturedRouteInfo.set(route);
         return BrokerResponseNative.empty();
+      }
+
+      @Override
+      protected BrokerResponseNative processMvSplitBrokerRequest(long requestId,
+          BrokerRequest originalBrokerRequest, TableRouteInfo baseRoute, TableRouteInfo mvRoute,
+          long timeoutMs, ServerStats serverStats, RequestContext requestContext)
+          throws Exception {
+        throw new UnsupportedOperationException("Not implemented in test");
       }
     };
   }

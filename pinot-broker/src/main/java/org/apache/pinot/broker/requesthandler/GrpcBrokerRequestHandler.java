@@ -25,8 +25,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import javax.annotation.Nullable;
 import javax.annotation.concurrent.ThreadSafe;
 import org.apache.pinot.broker.broker.AccessControlFactory;
+import org.apache.pinot.broker.materializedview.MvQueryRewriteEngine;
 import org.apache.pinot.broker.queryquota.QueryQuotaManager;
 import org.apache.pinot.common.config.GrpcConfig;
 import org.apache.pinot.common.config.provider.TableCache;
@@ -68,9 +70,9 @@ public class GrpcBrokerRequestHandler extends BaseSingleStageBrokerRequestHandle
       BrokerRequestIdGenerator requestIdGenerator, RoutingManager routingManager,
       AccessControlFactory accessControlFactory, QueryQuotaManager queryQuotaManager, TableCache tableCache,
       FailureDetector failureDetector, ThreadAccountant threadAccountant,
-      MultiClusterRoutingContext multiClusterRoutingContext) {
+      MultiClusterRoutingContext multiClusterRoutingContext, @Nullable MvQueryRewriteEngine mvQueryRewriteEngine) {
     super(config, brokerId, requestIdGenerator, routingManager, accessControlFactory, queryQuotaManager, tableCache,
-        threadAccountant, multiClusterRoutingContext);
+        threadAccountant, multiClusterRoutingContext, mvQueryRewriteEngine);
     _streamingReduceService = new StreamingReduceService(config);
     _streamingQueryClient = new PinotServerStreamingQueryClient(GrpcConfig.buildGrpcQueryConfig(config));
     _failureDetector = failureDetector;
@@ -119,6 +121,16 @@ public class GrpcBrokerRequestHandler extends BaseSingleStageBrokerRequestHandle
         _streamingReduceService.reduceOnStreamResponse(originalBrokerRequest, responseMap, timeoutMs, _brokerMetrics);
     brokerResponse.setBrokerReduceTimeMs(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - reduceStartTimeNs));
     return brokerResponse;
+  }
+
+  @Override
+  protected BrokerResponseNative processMvSplitBrokerRequest(long requestId,
+      BrokerRequest originalBrokerRequest, TableRouteInfo baseRoute, TableRouteInfo mvRoute,
+      long timeoutMs, ServerStats serverStats, RequestContext requestContext)
+      throws Exception {
+    // TODO: Implement MV split support for the GRPC request handler once the streaming reduce
+    //       service supports merging DataTables from two independent route sources.
+    throw new UnsupportedOperationException("MV split queries are not yet supported over GRPC");
   }
 
   /**

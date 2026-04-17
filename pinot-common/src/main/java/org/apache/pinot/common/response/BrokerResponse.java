@@ -437,4 +437,32 @@ public interface BrokerResponse {
    * @return true if RLS filters were applied, false otherwise
    */
   boolean getRLSFiltersApplied();
+
+  /**
+   * Set the candidate materialized view table names that were evaluated for this query.
+   */
+  default void setCandidateMvs(List<String> candidateMvs) {
+  }
+
+  /**
+   * Get the candidate materialized view table names that were evaluated for this query.
+   */
+  default List<String> getCandidateMvs() {
+    return List.of();
+  }
+
+  /**
+   * Set the materialized view table name that was hit (used) for this query.
+   */
+  default void setHitMv(@Nullable String hitMv) {
+  }
+
+  /**
+   * Get the materialized view table name that was hit (used) for this query,
+   * or {@code null} if no MV was used.
+   */
+  @Nullable
+  default String getHitMv() {
+    return null;
+  }
 }
