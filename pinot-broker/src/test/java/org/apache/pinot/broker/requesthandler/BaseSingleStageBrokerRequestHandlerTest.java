@@ -604,7 +604,7 @@ public class BaseSingleStageBrokerRequestHandlerTest {
     BaseSingleStageBrokerRequestHandler handler =
         new BaseSingleStageBrokerRequestHandler(config, "broker1", new BrokerRequestIdGenerator(),
             routingManager, new AllowAllAccessControlFactory(), quotaManager, tableCache,
-            ThreadAccountantUtils.getNoOpAccountant(), null) {
+            ThreadAccountantUtils.getNoOpAccountant(), null, mvEngine) {
           @Override
           public void start() {
           }
@@ -631,7 +631,6 @@ public class BaseSingleStageBrokerRequestHandlerTest {
             return null;
           }
         };
-    handler.setMvQueryRewriteEngine(mvEngine);
 
     BrokerResponseNative response = (BrokerResponseNative) handler.handleRequest(userSql);
     Assert.assertNotNull(response);
@@ -747,7 +746,7 @@ public class BaseSingleStageBrokerRequestHandlerTest {
     BaseSingleStageBrokerRequestHandler handler =
         new BaseSingleStageBrokerRequestHandler(config, "broker1", new BrokerRequestIdGenerator(),
             routingManager, accessControlFactory, quotaManager, tableCache,
-            ThreadAccountantUtils.getNoOpAccountant(), null) {
+            ThreadAccountantUtils.getNoOpAccountant(), null, mvEngine) {
           @Override
           public void start() {
           }
@@ -771,7 +770,6 @@ public class BaseSingleStageBrokerRequestHandlerTest {
             return BrokerResponseNative.empty();
           }
         };
-    handler.setMvQueryRewriteEngine(mvEngine);
 
     handler.handleRequest(userSql);
 
