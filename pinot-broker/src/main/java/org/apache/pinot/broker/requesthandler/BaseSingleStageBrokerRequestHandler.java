@@ -411,15 +411,25 @@ public abstract class BaseSingleStageBrokerRequestHandler extends BaseBrokerRequ
     @Nullable
     final Schema _mvSchema;
 
+    // For FULL_REWRITE, _serverPinotQuery and _tableName are overwritten to point at the MV
+    // table. These fields preserve the original (pre-rewrite) values so that access control
+    // authorization and RLS filter lookups are always performed against the base table.
+    @Nullable
+    final PinotQuery _preRewriteServerPinotQuery;
+    @Nullable
+    final String _preRewriteTableName;
+
     public CompileResult(PinotQuery pinotQuery, PinotQuery serverPinotQuery, Schema schema, String tableName,
         String rawTableName, @Nullable MvRewriteResult mvRewriteResult) {
-      this(pinotQuery, serverPinotQuery, schema, tableName, rawTableName, mvRewriteResult, null, null, null, null);
+      this(pinotQuery, serverPinotQuery, schema, tableName, rawTableName, mvRewriteResult, null, null, null, null,
+          null, null);
     }
 
     public CompileResult(PinotQuery pinotQuery, PinotQuery serverPinotQuery, Schema schema, String tableName,
         String rawTableName, @Nullable MvRewriteResult mvRewriteResult,
         @Nullable PinotQuery mvServerPinotQuery, @Nullable String mvTableName,
-        @Nullable String mvRawTableName, @Nullable Schema mvSchema) {
+        @Nullable String mvRawTableName, @Nullable Schema mvSchema,
+        @Nullable PinotQuery preRewriteServerPinotQuery, @Nullable String preRewriteTableName) {
       _pinotQuery = pinotQuery;
       _serverPinotQuery = serverPinotQuery;
       _schema = schema;
@@ -431,6 +441,8 @@ public abstract class BaseSingleStageBrokerRequestHandler extends BaseBrokerRequ
       _mvTableName = mvTableName;
       _mvRawTableName = mvRawTableName;
       _mvSchema = mvSchema;
+      _preRewriteServerPinotQuery = preRewriteServerPinotQuery;
+      _preRewriteTableName = preRewriteTableName;
     }
 
     public CompileResult(BrokerResponse errorOrLiteralOnlyBrokerResponse) {
@@ -445,6 +457,8 @@ public abstract class BaseSingleStageBrokerRequestHandler extends BaseBrokerRequ
       _mvTableName = null;
       _mvRawTableName = null;
       _mvSchema = null;
+      _preRewriteServerPinotQuery = null;
+      _preRewriteTableName = null;
     }
 
     /// Returns {@code true} when the query should be split into a base-table query and
@@ -498,11 +512,18 @@ public abstract class BaseSingleStageBrokerRequestHandler extends BaseBrokerRequ
     // Accounts for resource usage of the compilation phase, since compilation for some queries can be expensive.
     QueryThreadContext.checkTerminationAndSampleUsage("Broker request compilation");
 
-    // Second-stage table-level access control
+    // Second-stage table-level access control.
+    // For FULL_REWRITE MV rewrites, compileResult._preRewriteServerPinotQuery holds the
+    // original base-table server query. Authorization must run against it, not the rewritten
+    // MV query, so that access control for the base table cannot be bypassed via an MV.
     // TODO: Modify AccessControl interface to directly take PinotQuery
+    PinotQuery authServerPinotQuery = compileResult._preRewriteServerPinotQuery != null
+        ? compileResult._preRewriteServerPinotQuery : serverPinotQuery;
     BrokerRequest brokerRequest = CalciteSqlCompiler.convertToBrokerRequest(pinotQuery);
     BrokerRequest serverBrokerRequest =
         serverPinotQuery == pinotQuery ? brokerRequest : CalciteSqlCompiler.convertToBrokerRequest(serverPinotQuery);
+    BrokerRequest authBrokerRequest = authServerPinotQuery == serverPinotQuery ? serverBrokerRequest
+        : CalciteSqlCompiler.convertToBrokerRequest(authServerPinotQuery);
 
     TableRouteProvider routeProvider;
 
@@ -532,7 +553,7 @@ public abstract class BaseSingleStageBrokerRequestHandler extends BaseBrokerRequ
 
       routeProvider = _logicalTableRouteProvider;
     } else {
-      AuthorizationResult authorizationResult = accessControl.authorize(requesterIdentity, serverBrokerRequest);
+      AuthorizationResult authorizationResult = accessControl.authorize(requesterIdentity, authBrokerRequest);
 
       _brokerMetrics.addPhaseTiming(rawTableName, BrokerQueryPhase.AUTHORIZATION,
           System.nanoTime() - compilationEndTimeNs);
@@ -544,7 +565,12 @@ public abstract class BaseSingleStageBrokerRequestHandler extends BaseBrokerRequ
       }
 
       if (_enableRowColumnLevelAuth) {
-        TableRowColAccessResult rlsFilters = accessControl.getRowColFilters(requesterIdentity, tableName);
+        // For FULL_REWRITE MV queries, tableName has been overwritten to the MV table.
+        // RLS filters must be fetched for the original base table so that base-table security
+        // policies apply, not any (possibly absent) policies on the MV table.
+        String rlsTableName = compileResult._preRewriteTableName != null
+            ? compileResult._preRewriteTableName : tableName;
+        TableRowColAccessResult rlsFilters = accessControl.getRowColFilters(requesterIdentity, rlsTableName);
 
         //rewrite query
         Map<String, String> queryOptions =
@@ -568,7 +594,12 @@ public abstract class BaseSingleStageBrokerRequestHandler extends BaseBrokerRequ
         });
       }
 
-      // Validate QPS quota
+      // Validate QPS quota.
+      // For FULL_REWRITE MV queries, tableName has been overwritten to the MV table name.
+      // Quota must be charged against the original base table so that base-table rate limits
+      // cannot be bypassed by routing the query through an unthrottled MV table.
+      String quotaTableName = compileResult._preRewriteTableName != null
+          ? compileResult._preRewriteTableName : tableName;
       if (!_queryQuotaManager.acquireDatabase(database)) {
         String errorMessage =
             String.format("Request %d: %s exceeds query quota for database: %s", requestId, query, database);
@@ -576,9 +607,9 @@ public abstract class BaseSingleStageBrokerRequestHandler extends BaseBrokerRequ
         requestContext.setErrorCode(QueryErrorCode.TOO_MANY_REQUESTS);
         return new BrokerResponseNative(QueryErrorCode.TOO_MANY_REQUESTS, errorMessage);
       }
-      if (!_queryQuotaManager.acquire(tableName)) {
+      if (!_queryQuotaManager.acquire(quotaTableName)) {
         String errorMessage =
-            String.format("Request %d: %s exceeds query quota for table: %s", requestId, query, tableName);
+            String.format("Request %d: %s exceeds query quota for table: %s", requestId, query, quotaTableName);
         LOGGER.info(errorMessage);
         requestContext.setErrorCode(QueryErrorCode.TOO_MANY_REQUESTS);
         _brokerMetrics.addMeteredTableValue(rawTableName, BrokerMeter.QUERY_QUOTA_EXCEEDED, 1);
@@ -1172,6 +1203,8 @@ public abstract class BaseSingleStageBrokerRequestHandler extends BaseBrokerRequ
     String mvTableName = null;
     String mvRawTableName = null;
     Schema mvSchema = null;
+    PinotQuery preRewriteServerPinotQuery = null;
+    String preRewriteTableName = null;
 
     if (_mvQueryRewriteEngine != null
         && QueryOptionsUtils.isUseMaterializedView(serverPinotQuery.getQueryOptions())) {
@@ -1185,6 +1218,11 @@ public abstract class BaseSingleStageBrokerRequestHandler extends BaseBrokerRequ
           mvRawTableName = TableNameBuilder.extractRawTableName(mvTableName);
           mvSchema = _tableCache.getSchema(mvRawTableName);
         } else {
+          // Preserve the original server query and table name so that access control
+          // authorization and RLS filter lookups are performed against the base table,
+          // not the MV that replaced it.
+          preRewriteServerPinotQuery = serverPinotQuery;
+          preRewriteTableName = tableName;
           serverPinotQuery = plan.getMvQuery();
           pinotQuery = serverPinotQuery;
           tableName = plan.getMvTableNameWithType();
@@ -1197,7 +1235,8 @@ public abstract class BaseSingleStageBrokerRequestHandler extends BaseBrokerRequ
     _queryOptimizer.optimize(serverPinotQuery, schema);
 
     return new CompileResult(pinotQuery, serverPinotQuery, schema, tableName, rawTableName,
-        mvRewriteResult, mvServerPinotQuery, mvTableName, mvRawTableName, mvSchema);
+        mvRewriteResult, mvServerPinotQuery, mvTableName, mvRawTableName, mvSchema, preRewriteServerPinotQuery,
+        preRewriteTableName);
   }
 
   private void throwAccessDeniedError(long requestId, String query, RequestContext requestContext, String tableName,

@@ -26,7 +26,14 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicReference;
 import org.apache.helix.model.InstanceConfig;
+import org.apache.pinot.broker.api.AccessControl;
+import org.apache.pinot.broker.broker.AccessControlFactory;
 import org.apache.pinot.broker.broker.AllowAllAccessControlFactory;
+import org.apache.pinot.broker.materializedview.ExecutionMode;
+import org.apache.pinot.broker.materializedview.MatchType;
+import org.apache.pinot.broker.materializedview.MvQueryRewriteEngine;
+import org.apache.pinot.broker.materializedview.MvRewritePlan;
+import org.apache.pinot.broker.materializedview.MvRewriteResult;
 import org.apache.pinot.broker.queryquota.QueryQuotaManager;
 import org.apache.pinot.broker.routing.manager.BrokerRoutingManager;
 import org.apache.pinot.common.config.provider.TableCache;
@@ -43,6 +50,8 @@ import org.apache.pinot.core.routing.TableRouteInfo;
 import org.apache.pinot.core.routing.timeboundary.TimeBoundaryInfo;
 import org.apache.pinot.core.transport.ServerInstance;
 import org.apache.pinot.spi.accounting.ThreadAccountantUtils;
+import org.apache.pinot.spi.auth.TableAuthorizationResult;
+import org.apache.pinot.spi.auth.TableRowColAccessResultImpl;
 import org.apache.pinot.spi.config.table.TableConfig;
 import org.apache.pinot.spi.config.table.TenantConfig;
 import org.apache.pinot.spi.data.FieldSpec.DataType;
@@ -53,6 +62,7 @@ import org.apache.pinot.spi.exception.BadQueryRequestException;
 import org.apache.pinot.spi.trace.LoggerConstants;
 import org.apache.pinot.spi.trace.RequestContext;
 import org.apache.pinot.spi.utils.CommonConstants;
+import org.apache.pinot.spi.utils.CommonConstants.Broker;
 import org.apache.pinot.spi.utils.CommonConstants.Query.Range;
 import org.apache.pinot.sql.FilterKind;
 import org.apache.pinot.sql.parsers.CalciteSqlParser;
@@ -513,5 +523,269 @@ public class BaseSingleStageBrokerRequestHandlerTest {
     // Realtime merges to (1772109900000, 1772113500000].
     assertRangeFilter(routeInfo.getRealtimeBrokerRequest(), "created_15min",
         "(1772109900000" + Range.DELIMITER + "1772113500000]", "Realtime mixed");
+  }
+
+  /**
+   * Bug: FULL_REWRITE overwrites tableName to the MV table name, so
+   * _queryQuotaManager.acquire(tableName) charges quota against the MV
+   * instead of the base table. A throttled base table is effectively
+   * bypassed when its quota allows no traffic but the MV has no quota entry.
+   *
+   * <p>Before fix: acquire("baseTable_OFFLINE") is never called; the MV
+   * table passes because the mock only denies the base table name.
+   * <p>After fix: the base table name is used for quota accounting and the
+   * request is correctly rate-limited.
+   */
+  @Test
+  public void testMvFullRewriteQuotaAccountedAgainstBaseTable()
+      throws Exception {
+    String baseOfflineTable = "baseTable_OFFLINE";
+    String mvOfflineTable = "mv_baseTable_OFFLINE";
+    String baseRawTable = "baseTable";
+    String mvRawTable = "mv_baseTable";
+
+    // MV query: exact same columns but issued against the MV
+    String userSql = "SELECT ts, SUM(revenue) FROM baseTable GROUP BY ts LIMIT 100 "
+        + "OPTION(useMaterializedView='true')";
+    PinotQuery mvQuery = CalciteSqlParser.compileToPinotQuery(
+        "SELECT ts, SUM(revenue) FROM mv_baseTable_OFFLINE GROUP BY ts LIMIT 100");
+
+    MvRewritePlan plan = new MvRewritePlan(
+        mvOfflineTable, MatchType.EXACT, ExecutionMode.FULL_REWRITE, mvQuery, null, 1.0);
+    MvRewriteResult mvResult = new MvRewriteResult(List.of(mvOfflineTable), plan);
+
+    MvQueryRewriteEngine mvEngine = mock(MvQueryRewriteEngine.class);
+    when(mvEngine.tryRewrite(any(PinotQuery.class), anyString())).thenReturn(mvResult);
+
+    Schema baseSchema = new Schema.SchemaBuilder()
+        .setSchemaName(baseRawTable)
+        .addSingleValueDimension("ts", DataType.STRING)
+        .addMetric("revenue", DataType.DOUBLE)
+        .build();
+    Schema mvSchema = new Schema.SchemaBuilder()
+        .setSchemaName(mvRawTable)
+        .addSingleValueDimension("ts", DataType.STRING)
+        .addMetric("revenue", DataType.DOUBLE)
+        .build();
+
+    TableCache tableCache = mock(TableCache.class);
+    when(tableCache.getActualTableName(baseRawTable)).thenReturn(baseRawTable);
+    when(tableCache.getSchema(baseRawTable)).thenReturn(baseSchema);
+    when(tableCache.getSchema(mvRawTable)).thenReturn(mvSchema);
+    when(tableCache.getColumnNameMap(anyString())).thenReturn(Map.of("ts", "ts", "revenue", "revenue"));
+    TableConfig tableCfg = mock(TableConfig.class);
+    TenantConfig tenant = new TenantConfig("t_BROKER", "t_SERVER", null);
+    when(tableCfg.getTenantConfig()).thenReturn(tenant);
+    when(tableCache.getTableConfig(baseOfflineTable)).thenReturn(tableCfg);
+    when(tableCache.getTableConfig(mvOfflineTable)).thenReturn(tableCfg);
+
+    BrokerRoutingManager routingManager = mock(BrokerRoutingManager.class);
+    when(routingManager.routingExists(baseOfflineTable)).thenReturn(true);
+    when(routingManager.routingExists(mvOfflineTable)).thenReturn(true);
+    when(routingManager.getQueryTimeoutMs(anyString())).thenReturn(10000L);
+    RoutingTable rt = mock(RoutingTable.class);
+    when(rt.getServerInstanceToSegmentsMap()).thenReturn(
+        Map.of(new ServerInstance(new InstanceConfig("server01_9000")),
+            new SegmentsToQuery(List.of("seg01"), List.of())));
+    when(routingManager.getRoutingTable(any(), Mockito.anyLong())).thenReturn(rt);
+
+    // Only deny the base table; the MV has no quota entry (returns true).
+    QueryQuotaManager quotaManager = mock(QueryQuotaManager.class);
+    when(quotaManager.acquireDatabase(anyString())).thenReturn(true);
+    when(quotaManager.acquireApplication(anyString())).thenReturn(true);
+    // Base table is over quota; MV is not throttled.
+    when(quotaManager.acquire(baseOfflineTable)).thenReturn(false);
+    when(quotaManager.acquire(mvOfflineTable)).thenReturn(true);
+
+    BrokerMetrics.register(mock(BrokerMetrics.class));
+    PinotConfiguration config = new PinotConfiguration();
+    BrokerQueryEventListenerFactory.init(config);
+
+    BaseSingleStageBrokerRequestHandler handler =
+        new BaseSingleStageBrokerRequestHandler(config, "broker1", new BrokerRequestIdGenerator(),
+            routingManager, new AllowAllAccessControlFactory(), quotaManager, tableCache,
+            ThreadAccountantUtils.getNoOpAccountant(), null) {
+          @Override
+          public void start() {
+          }
+
+          @Override
+          public void shutDown() {
+          }
+
+          @Override
+          protected BrokerResponseNative processBrokerRequest(long requestId,
+              BrokerRequest originalBrokerRequest, BrokerRequest serverBrokerRequest,
+              TableRouteInfo route, long timeoutMs, ServerStats serverStats,
+              RequestContext requestContext) {
+            // Should not reach here — quota must reject before routing
+            Assert.fail("processBrokerRequest should not be called when base table is over quota");
+            return null;
+          }
+
+          @Override
+          protected BrokerResponseNative processMvSplitBrokerRequest(long requestId,
+              BrokerRequest originalBrokerRequest, TableRouteInfo baseRoute, TableRouteInfo mvRoute,
+              long timeoutMs, ServerStats serverStats, RequestContext requestContext) {
+            Assert.fail("processMvSplitBrokerRequest should not be called when base table is over quota");
+            return null;
+          }
+        };
+    handler.setMvQueryRewriteEngine(mvEngine);
+
+    BrokerResponseNative response = (BrokerResponseNative) handler.handleRequest(userSql);
+    Assert.assertNotNull(response);
+    // The request must be rejected with TOO_MANY_REQUESTS because the base table is over quota
+    Assert.assertEquals(response.getExceptionsSize(), 1,
+        "Expected quota rejection exception but got: " + response.getExceptions());
+    Assert.assertEquals(response.getExceptions().get(0).getErrorCode(),
+        org.apache.pinot.spi.exception.QueryErrorCode.TOO_MANY_REQUESTS.getId(),
+        "Expected TOO_MANY_REQUESTS error code");
+  }
+
+  /**
+   * Bug: FULL_REWRITE overwrites tableName to the MV table name, so
+   * accessControl.getRowColFilters(requesterIdentity, tableName) fetches RLS
+   * policy for the MV table instead of the base table.
+   *
+   * <p>Before fix: getRowColFilters is called with the MV table name
+   * "mv_baseTable_OFFLINE".
+   * <p>After fix: getRowColFilters is called with the original base table
+   * name "baseTable_OFFLINE".
+   */
+  @Test
+  public void testMvFullRewriteRlsLookupUsesBaseTable()
+      throws Exception {
+    String baseOfflineTable = "baseTable_OFFLINE";
+    String mvOfflineTable = "mv_baseTable_OFFLINE";
+    String baseRawTable = "baseTable";
+    String mvRawTable = "mv_baseTable";
+
+    String userSql = "SELECT ts, SUM(revenue) FROM baseTable GROUP BY ts LIMIT 100 "
+        + "OPTION(useMaterializedView='true')";
+    PinotQuery mvQuery = CalciteSqlParser.compileToPinotQuery(
+        "SELECT ts, SUM(revenue) FROM mv_baseTable_OFFLINE GROUP BY ts LIMIT 100");
+
+    MvRewritePlan plan = new MvRewritePlan(
+        mvOfflineTable, MatchType.EXACT, ExecutionMode.FULL_REWRITE, mvQuery, null, 1.0);
+    MvRewriteResult mvResult = new MvRewriteResult(List.of(mvOfflineTable), plan);
+
+    MvQueryRewriteEngine mvEngine = mock(MvQueryRewriteEngine.class);
+    when(mvEngine.tryRewrite(any(PinotQuery.class), anyString())).thenReturn(mvResult);
+
+    Schema baseSchema = new Schema.SchemaBuilder()
+        .setSchemaName(baseRawTable)
+        .addSingleValueDimension("ts", DataType.STRING)
+        .addMetric("revenue", DataType.DOUBLE)
+        .build();
+    Schema mvSchema = new Schema.SchemaBuilder()
+        .setSchemaName(mvRawTable)
+        .addSingleValueDimension("ts", DataType.STRING)
+        .addMetric("revenue", DataType.DOUBLE)
+        .build();
+
+    TableCache tableCache = mock(TableCache.class);
+    when(tableCache.getActualTableName(baseRawTable)).thenReturn(baseRawTable);
+    when(tableCache.getSchema(baseRawTable)).thenReturn(baseSchema);
+    when(tableCache.getSchema(mvRawTable)).thenReturn(mvSchema);
+    when(tableCache.getColumnNameMap(anyString())).thenReturn(Map.of("ts", "ts", "revenue", "revenue"));
+    TableConfig tableCfg = mock(TableConfig.class);
+    TenantConfig tenant = new TenantConfig("t_BROKER", "t_SERVER", null);
+    when(tableCfg.getTenantConfig()).thenReturn(tenant);
+    when(tableCache.getTableConfig(baseOfflineTable)).thenReturn(tableCfg);
+    when(tableCache.getTableConfig(mvOfflineTable)).thenReturn(tableCfg);
+
+    BrokerRoutingManager routingManager = mock(BrokerRoutingManager.class);
+    when(routingManager.routingExists(baseOfflineTable)).thenReturn(true);
+    when(routingManager.routingExists(mvOfflineTable)).thenReturn(true);
+    when(routingManager.getQueryTimeoutMs(anyString())).thenReturn(10000L);
+    RoutingTable rt = mock(RoutingTable.class);
+    when(rt.getServerInstanceToSegmentsMap()).thenReturn(
+        Map.of(new ServerInstance(new InstanceConfig("server01_9000")),
+            new SegmentsToQuery(List.of("seg01"), List.of())));
+    when(routingManager.getRoutingTable(any(), Mockito.anyLong())).thenReturn(rt);
+
+    QueryQuotaManager quotaManager = mock(QueryQuotaManager.class);
+    when(quotaManager.acquire(anyString())).thenReturn(true);
+    when(quotaManager.acquireDatabase(anyString())).thenReturn(true);
+    when(quotaManager.acquireApplication(anyString())).thenReturn(true);
+
+    // Use a concrete AccessControl that allows everything but records the table passed to getRowColFilters.
+    // A Mockito mock of an interface cannot reliably stub default interface methods, so we use an
+    // anonymous implementation to avoid NPEs from un-stubbed default-method paths.
+    List<String> capturedRlsTables = new java.util.ArrayList<>();
+    AccessControl accessControl = new AccessControl() {
+      @Override
+      public org.apache.pinot.spi.auth.AuthorizationResult authorize(
+          org.apache.pinot.spi.auth.broker.RequesterIdentity identity, BrokerRequest request) {
+        return TableAuthorizationResult.success();
+      }
+
+      @Override
+      public TableAuthorizationResult authorize(
+          org.apache.pinot.spi.auth.broker.RequesterIdentity identity, Set<String> tables) {
+        return TableAuthorizationResult.success();
+      }
+
+      @Override
+      public org.apache.pinot.spi.auth.TableRowColAccessResult getRowColFilters(
+          org.apache.pinot.spi.auth.broker.RequesterIdentity identity, String tableWithType) {
+        capturedRlsTables.add(tableWithType);
+        return TableRowColAccessResultImpl.unrestricted();
+      }
+    };
+
+    AccessControlFactory accessControlFactory = mock(AccessControlFactory.class);
+    when(accessControlFactory.create()).thenReturn(accessControl);
+
+    BrokerMetrics.register(mock(BrokerMetrics.class));
+    // Enable row/column-level auth so the RLS path is exercised
+    PinotConfiguration config = new PinotConfiguration(
+        Map.of(Broker.CONFIG_OF_BROKER_ENABLE_ROW_COLUMN_LEVEL_AUTH, "true"));
+    BrokerQueryEventListenerFactory.init(config);
+
+    BaseSingleStageBrokerRequestHandler handler =
+        new BaseSingleStageBrokerRequestHandler(config, "broker1", new BrokerRequestIdGenerator(),
+            routingManager, accessControlFactory, quotaManager, tableCache,
+            ThreadAccountantUtils.getNoOpAccountant(), null) {
+          @Override
+          public void start() {
+          }
+
+          @Override
+          public void shutDown() {
+          }
+
+          @Override
+          protected BrokerResponseNative processBrokerRequest(long requestId,
+              BrokerRequest originalBrokerRequest, BrokerRequest serverBrokerRequest,
+              TableRouteInfo route, long timeoutMs, ServerStats serverStats,
+              RequestContext requestContext) {
+            return BrokerResponseNative.empty();
+          }
+
+          @Override
+          protected BrokerResponseNative processMvSplitBrokerRequest(long requestId,
+              BrokerRequest originalBrokerRequest, TableRouteInfo baseRoute, TableRouteInfo mvRoute,
+              long timeoutMs, ServerStats serverStats, RequestContext requestContext) {
+            return BrokerResponseNative.empty();
+          }
+        };
+    handler.setMvQueryRewriteEngine(mvEngine);
+
+    handler.handleRequest(userSql);
+
+    // getRowColFilters must have been called with the base table name, not the MV table
+    Assert.assertFalse(capturedRlsTables.isEmpty(),
+        "getRowColFilters should have been called");
+    String rlsTable = capturedRlsTables.get(0);
+    Assert.assertNotEquals(rlsTable, mvOfflineTable,
+        "RLS filter lookup must NOT use MV table name but got: " + rlsTable);
+    // The RLS lookup must use the original base table identity, not the MV table.
+    // The table name stored in preRewriteTableName is the raw name from compileSingleStageBrokerRequest
+    // (before type resolution), so we assert on baseRawTable, not baseOfflineTable.
+    Assert.assertEquals(rlsTable, baseRawTable,
+        "RLS filter lookup must use base table '" + baseRawTable
+            + "' not MV table, but got: " + rlsTable);
   }
 }

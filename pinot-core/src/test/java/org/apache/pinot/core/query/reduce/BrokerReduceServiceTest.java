@@ -129,7 +129,6 @@ public class BrokerReduceServiceTest {
     brokerReduceService.shutDown();
   }
 
-  // TODO: Remove this PoC test after query SQL split (baseTable query + MV query -> reduce merge) is fully implemented.
   @Test
   public void testSelectionRowMergeFromTwoSources()
       throws IOException {
@@ -182,7 +181,6 @@ public class BrokerReduceServiceTest {
     assertEquals(col1Values, Set.of(1, 2, 3, 4, 5));
   }
 
-  // TODO: Remove this PoC test after query SQL split (baseTable query + MV query -> reduce merge) is fully implemented.
   @Test
   public void testAggregationMergeFromTwoSources()
       throws IOException {
@@ -237,7 +235,6 @@ public class BrokerReduceServiceTest {
     assertEquals(row[3], 200.0);   // MAX: max(200, 150)
   }
 
-  // TODO: Remove this PoC test after query SQL split (baseTable query + MV query -> reduce merge) is fully implemented.
   @Test
   public void testDistinctCountHllMergeFromTwoSources()
       throws Exception {
@@ -296,7 +293,6 @@ public class BrokerReduceServiceTest {
     assertEquals(distinctCount, 8L);
   }
 
-  // TODO: Remove this PoC test after query SQL split (baseTable query + MV query -> reduce merge) is fully implemented.
   @Test
   public void testGroupByMergeFromTwoSources()
       throws IOException {
@@ -379,7 +375,6 @@ public class BrokerReduceServiceTest {
     assertEquals(resultMap.get("SZ")[2], 1L);
   }
 
-  // TODO: Remove this PoC test after query SQL split (baseTable query + MV query -> reduce merge) is fully implemented.
   @Test
   public void testGroupByWithTimeColumnMergeFromTwoSources()
       throws IOException {

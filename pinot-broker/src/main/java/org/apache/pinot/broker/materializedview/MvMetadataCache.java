@@ -20,8 +20,10 @@ package org.apache.pinot.broker.materializedview;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import javax.annotation.Nullable;
 import org.apache.commons.collections4.CollectionUtils;
@@ -242,18 +244,20 @@ public class MvMetadataCache {
   private class ZkDefinitionListener implements IZkChildListener, IZkDataListener {
     @Override
     public synchronized void handleChildChange(String path, List<String> children) {
-      java.util.Set<String> currentChildren = (children == null)
-          ? java.util.Collections.emptySet() : new java.util.HashSet<>(children);
+      Set<String> newChildSet = CollectionUtils.isNotEmpty(children)
+          ? new HashSet<>(children) : Collections.emptySet();
 
-      for (String existingMv : new ArrayList<>(_mvEntryMap.keySet())) {
-        if (!currentChildren.contains(existingMv)) {
-          removeDefinitionEntry(MV_DEFINITION_PATH_PREFIX + existingMv);
+      // Evict entries that are no longer present in ZK (MV table deleted).
+      for (String existing : new ArrayList<>(_mvEntryMap.keySet())) {
+        if (!newChildSet.contains(existing)) {
+          removeDefinitionEntry(MV_DEFINITION_PATH_PREFIX + existing);
         }
       }
 
+      // Register newly added entries.
       List<String> defPathsToAdd = new ArrayList<>();
       List<String> rtPathsToAdd = new ArrayList<>();
-      for (String mvTableName : currentChildren) {
+      for (String mvTableName : newChildSet) {
         if (!_mvEntryMap.containsKey(mvTableName)) {
           defPathsToAdd.add(MV_DEFINITION_PATH_PREFIX + mvTableName);
           rtPathsToAdd.add(MV_RUNTIME_PATH_PREFIX + mvTableName);
@@ -285,11 +289,19 @@ public class MvMetadataCache {
   private class ZkRuntimeListener implements IZkChildListener, IZkDataListener {
     @Override
     public synchronized void handleChildChange(String path, List<String> children) {
-      if (CollectionUtils.isEmpty(children)) {
-        return;
+      Set<String> newChildSet = CollectionUtils.isNotEmpty(children)
+          ? new HashSet<>(children) : Collections.emptySet();
+
+      // Unsubscribe data listeners for runtime nodes that are no longer present.
+      for (String mvTableName : _mvEntryMap.keySet()) {
+        if (!newChildSet.contains(mvTableName)) {
+          _propertyStore.unsubscribeDataChanges(MV_RUNTIME_PATH_PREFIX + mvTableName, _runtimeListener);
+        }
       }
+
+      // Subscribe for any newly visible runtime nodes.
       List<String> rtPathsToAdd = new ArrayList<>();
-      for (String mvTableName : children) {
+      for (String mvTableName : newChildSet) {
         if (_mvEntryMap.containsKey(mvTableName)) {
           rtPathsToAdd.add(MV_RUNTIME_PATH_PREFIX + mvTableName);
         }

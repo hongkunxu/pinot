@@ -118,7 +118,10 @@ public class GrpcMvQueryExecutor implements MvQueryExecutor {
       ResponseEncoder responseEncoder = ResponseEncoderFactory.getResponseEncoder(encodingType);
 
       byte[] respBytes = dataResponse.getPayload().toByteArray();
-      int rowSize = Integer.parseInt(responseMetadata.get("rowSize"));
+      String rowSizeStr = responseMetadata.get("rowSize");
+      com.google.common.base.Preconditions.checkNotNull(rowSizeStr,
+          "gRPC response metadata missing required 'rowSize' field");
+      int rowSize = Integer.parseInt(rowSizeStr);
       byte[] uncompressedPayload;
       try {
         uncompressedPayload = compressor.decompress(respBytes);

@@ -128,9 +128,13 @@ public class GrpcBrokerRequestHandler extends BaseSingleStageBrokerRequestHandle
       BrokerRequest originalBrokerRequest, TableRouteInfo baseRoute, TableRouteInfo mvRoute,
       long timeoutMs, ServerStats serverStats, RequestContext requestContext)
       throws Exception {
-    // TODO: Implement MV split support for the GRPC request handler once the streaming reduce
-    //       service supports merging DataTables from two independent route sources.
-    throw new UnsupportedOperationException("MV split queries are not yet supported over GRPC");
+    // GRPC streaming reduce does not yet support merging DataTables from two independent routes.
+    // Fall back to the unre-written base-table query so the request produces correct (if slower)
+    // results rather than crashing with an UnsupportedOperationException.
+    LOGGER.warn("Request {}: MV SPLIT_REWRITE is not supported over GRPC; "
+        + "falling back to base-table query", requestId);
+    return processBrokerRequest(requestId, originalBrokerRequest, originalBrokerRequest,
+        baseRoute, timeoutMs, serverStats, requestContext);
   }
 
   /**

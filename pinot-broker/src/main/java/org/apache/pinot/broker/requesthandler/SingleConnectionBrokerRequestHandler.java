@@ -20,6 +20,7 @@ package org.apache.pinot.broker.requesthandler;
 
 import com.google.common.collect.Maps;
 import java.util.ArrayList;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
@@ -222,12 +223,14 @@ public class SingleConnectionBrokerRequestHandler extends BaseSingleStageBrokerR
     _brokerMetrics.addPhaseTiming(rawTableName, BrokerQueryPhase.SCATTER_GATHER,
         System.nanoTime() - scatterGatherStartTimeNs);
 
-    // Merge all DataTables from both base and MV responses into a single map.
-    // The ServerRoutingInstance keys are naturally distinct because they come from
-    // different physical tables hosted on (potentially) different servers.
+    // Merge DataTables from both base and MV responses into a single map using identity
+    // equality so that ServerRoutingInstance objects from different sub-queries never collide.
+    // ServerRoutingInstance.equals() keyed on (hostname, port, tableType) can produce the
+    // same hash for base and MV rows on a shared server, causing silent overwrites with a
+    // regular HashMap.
     int totalServersQueried = baseFinalResponses.size() + mvFinalResponses.size();
     long totalResponseSize = 0;
-    Map<ServerRoutingInstance, DataTable> dataTableMap = Maps.newHashMapWithExpectedSize(totalServersQueried);
+    Map<ServerRoutingInstance, DataTable> dataTableMap = new IdentityHashMap<>(totalServersQueried);
     List<ServerRoutingInstance> serversNotResponded = new ArrayList<>();
 
     for (Map.Entry<ServerRoutingInstance, ServerResponse> entry : baseFinalResponses.entrySet()) {

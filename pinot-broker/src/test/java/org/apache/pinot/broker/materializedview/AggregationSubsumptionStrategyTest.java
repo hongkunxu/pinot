@@ -716,6 +716,29 @@ public class AggregationSubsumptionStrategyTest {
     assertNull(result, "AVG has no equivalence rule registered");
   }
 
+  /**
+   * Regression test: the MV stores AVG(revenue) as a pre-computed column. Even though the user
+   * query's AVG(revenue) is an exact key in the MV projection map, there is no
+   * AggregationEquivalence rule for AVG (it is not re-aggregatable from a pre-computed average).
+   * The old code fell through to a bare-column rewrite (avg_rev), producing wrong results.
+   * The fix requires a rule to exist before accepting the MV candidate.
+   */
+  @Test
+  public void testRejectAvgEvenWhenMvHasExactAvgColumn() {
+    // MV materialises AVG(revenue) directly — but there is no distributive re-aggregation rule.
+    String definedSql =
+        "SELECT city, state, AVG(revenue) AS avg_rev FROM orders GROUP BY city, state";
+    MvMetadataCache.MvCacheEntry entry = createEntry("mv_orders_OFFLINE", "orders", definedSql);
+
+    PinotQuery userQuery = CalciteSqlParser.compileToPinotQuery(
+        "SELECT city, AVG(revenue) FROM orders GROUP BY city");
+    MvRewritePlan result = _strategy.match(userQuery, entry);
+
+    assertNull(result,
+        "AVG has no re-aggregation rule; MV with exact AVG column must be rejected, not silently rewritten "
+            + "to a bare identifier that would compute wrong results over finer-granularity groups");
+  }
+
   @Test
   public void testFinerMvRejectSketchFunctionMismatch() {
     String definedSql =

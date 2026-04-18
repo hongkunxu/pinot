@@ -94,9 +94,17 @@ public class AggregationSubsumptionStrategy extends AbstractSubsumptionStrategy 
     }
     for (Expression expr : userSelectList) {
       Expression stripped = MvMatchUtils.stripAlias(expr);
-      if (mvProjectionMap.containsKey(stripped)) {
+      // Plain column reference: direct MV projection hit is sufficient.
+      if (stripped.getFunctionCall() == null) {
+        if (!mvProjectionMap.containsKey(stripped)) {
+          return false;
+        }
         continue;
       }
+      // Aggregate function: an exact projection match is NOT enough on its own. We need an
+      // AggregationEquivalence rule to re-aggregate the pre-computed MV column correctly.
+      // Without a rule we would fall back to a bare column reference (e.g. AVG(revenue) →
+      // avg_rev), which produces wrong results for non-distributive functions.
       if (findEquivalentMvEntry(stripped, mvProjectionMap) == null) {
         return false;
       }
@@ -132,11 +140,6 @@ public class AggregationSubsumptionStrategy extends AbstractSubsumptionStrategy 
     return null;
   }
 
-  // TODO: Current approach strips ALL literal operands before comparison. This
-  //  tolerates broker-injected config params (e.g. log2m from
-  //  handleHLLLog2mOverride) but may be too permissive — if a function has
-  //  semantically significant literal operands (e.g. PERCENTILE(col, 50) vs
-  //  PERCENTILE(col, 99)), stripping them would cause an incorrect match.
   private static boolean operandsMatch(@Nullable List<Expression> a, @Nullable List<Expression> b) {
     if (a == null && b == null) {
       return true;
@@ -144,17 +147,30 @@ public class AggregationSubsumptionStrategy extends AbstractSubsumptionStrategy 
     if (a == null || b == null) {
       return false;
     }
-    return extractColumnOperands(a).equals(extractColumnOperands(b));
-  }
-
-  private static List<Expression> extractColumnOperands(List<Expression> operands) {
-    List<Expression> result = new ArrayList<>(operands.size());
-    for (Expression expr : operands) {
-      if (expr.getType() != ExpressionType.LITERAL) {
-        result.add(expr);
+    // MV definitions are authored without broker-injected config literals (e.g. log2m for HLL).
+    // The broker may append trailing literals to the user query at runtime. We tolerate those
+    // by comparing only up to the MV's operand count — but only when the extra operands in the
+    // user query are all literals (so PERCENTILE(col,50) vs PERCENTILE(col,99) still rejects,
+    // because the MV also carries the literal 99 as a semantically significant operand).
+    int mvSize = b.size();
+    int userSize = a.size();
+    if (userSize < mvSize) {
+      return false;
+    }
+    // All operands up to mvSize must match exactly.
+    for (int i = 0; i < mvSize; i++) {
+      if (!a.get(i).equals(b.get(i))) {
+        return false;
       }
     }
-    return result;
+    // Extra user operands (beyond the MV operand count) must all be literals —
+    // otherwise this is a semantically distinct call, not just a config injection.
+    for (int i = mvSize; i < userSize; i++) {
+      if (a.get(i).getType() != ExpressionType.LITERAL) {
+        return false;
+      }
+    }
+    return true;
   }
 
   @Override
@@ -307,19 +323,6 @@ public class AggregationSubsumptionStrategy extends AbstractSubsumptionStrategy 
 
   private Expression rewriteAggregationExpression(Expression stripped,
       Map<Expression, String> mvProjectionMap) {
-    if (mvProjectionMap.containsKey(stripped)) {
-      String mvCol = mvProjectionMap.get(stripped);
-      Function func = stripped.getFunctionCall();
-      if (func != null) {
-        AggregationEquivalence rule =
-            AggregationEquivalenceRegistry.findRule(func.getOperator(), func.getOperator());
-        if (rule != null) {
-          return rule.rewrite(stripped, mvCol);
-        }
-      }
-      return RequestUtils.getIdentifierExpression(mvCol);
-    }
-
     Object[] match = findEquivalentMvEntry(stripped, mvProjectionMap);
     if (match != null) {
       String mvCol = (String) match[0];

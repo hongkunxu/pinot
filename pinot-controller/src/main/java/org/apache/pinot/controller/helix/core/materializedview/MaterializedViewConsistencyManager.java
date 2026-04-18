@@ -37,6 +37,7 @@ import org.apache.pinot.common.minion.MvFreshness;
 import org.apache.pinot.common.minion.MvRuntimeMetadata;
 import org.apache.pinot.common.minion.PartitionInfo;
 import org.apache.pinot.common.minion.PartitionState;
+import org.apache.pinot.core.common.MinionConstants;
 import org.apache.pinot.spi.config.table.TableConfig;
 import org.apache.pinot.spi.config.table.TableTaskConfig;
 import org.apache.pinot.spi.utils.TimeUtils;
@@ -139,11 +140,12 @@ public class MaterializedViewConsistencyManager {
           return existing;
         });
 
-    ScheduledFuture<?> oldTimer = _pendingTimers.put(baseTableName,
-        _scheduler.schedule(() -> flush(baseTableName), DEBOUNCE_DELAY_MS, TimeUnit.MILLISECONDS));
-    if (oldTimer != null) {
-      oldTimer.cancel(false);
-    }
+    _pendingTimers.compute(baseTableName, (key, prev) -> {
+      if (prev != null) {
+        prev.cancel(false);
+      }
+      return _scheduler.schedule(() -> flush(baseTableName), DEBOUNCE_DELAY_MS, TimeUnit.MILLISECONDS);
+    });
   }
 
   /**
@@ -297,7 +299,7 @@ public class MaterializedViewConsistencyManager {
         return -1;
       }
       Map<String, String> mvTaskConfigs =
-          taskConfig.getConfigsForTaskType("MaterializedViewTask");
+          taskConfig.getConfigsForTaskType(MinionConstants.MaterializedViewTask.TASK_TYPE);
       if (mvTaskConfigs == null) {
         return -1;
       }

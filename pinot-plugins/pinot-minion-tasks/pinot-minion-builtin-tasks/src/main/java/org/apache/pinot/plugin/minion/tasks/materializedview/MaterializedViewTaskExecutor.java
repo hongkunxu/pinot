@@ -18,6 +18,7 @@
  */
 package org.apache.pinot.plugin.minion.tasks.materializedview;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import java.io.File;
 import java.net.URI;
@@ -194,8 +195,14 @@ public class MaterializedViewTaskExecutor extends BaseTaskExecutor {
 
     String uploadURL = configs.get(MinionConstants.UPLOAD_URL_KEY);
 
+    // Generate a per-attempt UUID so segment names are unique across retries of the same window.
+    // Helix reuses the same subtask id (PinotTaskConfig#getTaskId) on every retry, so we cannot
+    // rely on taskId for uniqueness — a retry after a partial upload would reproduce identical
+    // names and the controller would reject the new lineage entry.
+    String attemptId = UUID.randomUUID().toString();
+
     File tempDir = new File(FileUtils.getTempDirectory(),
-        "mv_task_" + tableName + "_" + UUID.randomUUID());
+        "mv_task_" + tableName + "_" + attemptId);
     FileUtils.forceMkdir(tempDir);
 
     try {
@@ -208,8 +215,8 @@ public class MaterializedViewTaskExecutor extends BaseTaskExecutor {
         int toIndex = Math.min(fromIndex + maxNumRecordsPerSegment, totalRows);
         List<GenericRow> chunk = rows.subList(fromIndex, toIndex);
 
-        String segmentName = tableName + "_" + windowStartMs + "_" + windowEndMs
-            + "_" + System.currentTimeMillis();
+        String segmentName = buildSegmentName(
+            tableName, windowStartMs, windowEndMs, attemptId, segIdx);
 
         File segmentOutputDir = new File(tempDir, "segmentOutput_" + segIdx);
         FileUtils.forceMkdir(segmentOutputDir);
@@ -459,5 +466,18 @@ public class MaterializedViewTaskExecutor extends BaseTaskExecutor {
       genericRows.add(genericRow);
     }
     return genericRows;
+  }
+
+  /**
+   * Builds a segment name that is stable within a single attempt but unique across retries of the
+   * same window. The {@code attemptId} must be a per-invocation value (e.g., a fresh UUID) and
+   * must NOT be the Helix subtask id, which is reused across retries. Using the Helix subtask id
+   * would reproduce identical names on retry, causing the controller to reject the new lineage
+   * entry when segments from a previous partial attempt already exist.
+   */
+  @VisibleForTesting
+  static String buildSegmentName(String tableName, long windowStartMs, long windowEndMs,
+      String attemptId, int segIdx) {
+    return tableName + "_" + windowStartMs + "_" + windowEndMs + "_" + attemptId + "_" + segIdx;
   }
 }
