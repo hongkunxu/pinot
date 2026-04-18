@@ -117,7 +117,10 @@ public class ScanSubsumptionStrategy extends AbstractSubsumptionStrategy {
     PinotQuery rewritten = userQuery.deepCopy();
     rewritten.getDataSource().setTableName(candidateEntry.getMvTableNameWithType());
     rewritten.setSelectList(MvMatchUtils.rewriteSelectList(userQuery.getSelectList(), mvProjectionMap));
-    rewritten.setFilterExpression(residualFilter);
+    // Remap residual filter columns to MV column names in case the MV uses aliased columns.
+    Expression remappedResidual = residualFilter != null
+        ? MvMatchUtils.remapExpression(residualFilter, mvProjectionMap) : null;
+    rewritten.setFilterExpression(remappedResidual);
 
     double cost = filtersEqual ? COST_SCAN_SUBSUMPTION : COST_SCAN_WITH_RESIDUAL;
     return new MvRewritePlan(candidateEntry.getMvTableNameWithType(),

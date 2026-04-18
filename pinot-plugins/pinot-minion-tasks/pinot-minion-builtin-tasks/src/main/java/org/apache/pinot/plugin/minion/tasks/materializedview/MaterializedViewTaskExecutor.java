@@ -383,7 +383,11 @@ public class MaterializedViewTaskExecutor extends BaseTaskExecutor {
   private void updateMvRuntime(Map<String, String> configs, String tableName,
       String taskMode, long windowStartMs, long windowEndMs) {
     HelixPropertyStore<ZNRecord> propertyStore = MINION_CONTEXT.getHelixPropertyStore();
-    MvRuntimeMetadata existing = MvRuntimeMetadataUtils.fetch(propertyStore, tableName);
+    // Re-fetch with version at write time to avoid overwriting concurrent ConsistencyManager
+    // updates (e.g. STALE markings) that arrived after preProcess captured _runtimeExpectedVersion.
+    org.apache.zookeeper.data.Stat freshStat = new org.apache.zookeeper.data.Stat();
+    MvRuntimeMetadata existing = MvRuntimeMetadataUtils.fetchWithVersion(propertyStore, tableName, freshStat);
+    int writeVersion = (existing != null) ? freshStat.getVersion() : -1;
 
     Map<Long, PartitionInfo> mergedInfos;
     long existingWatermarkMs;
@@ -438,7 +442,7 @@ public class MaterializedViewTaskExecutor extends BaseTaskExecutor {
     MvFreshness freshness = MvRuntimeMetadata.computeFreshness(mergedInfos);
     MvRuntimeMetadata updated = new MvRuntimeMetadata(
         tableName, newWatermarkMs, newCoverageUpperMs, freshness, mergedInfos);
-    MvRuntimeMetadataUtils.persist(propertyStore, updated, _runtimeExpectedVersion);
+    MvRuntimeMetadataUtils.persist(propertyStore, updated, writeVersion);
 
     LOGGER.info("Updated MV runtime for table: {} (partitions={}, watermarkMs={}, coverageUpperMs={})",
         tableName, mergedInfos.size(), newWatermarkMs, newCoverageUpperMs);

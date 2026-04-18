@@ -138,7 +138,7 @@ public class MvMetadataCache {
     MvCacheEntry newEntry;
     if (existing != null) {
       newEntry = new MvCacheEntry(definition, compiledQuery,
-          existing._coverageUpperMs, existing._freshness);
+          existing.getCoverageUpperMs(), existing.getFreshness());
     } else {
       newEntry = new MvCacheEntry(definition, compiledQuery, 0L, MvFreshness.FRESH);
     }
@@ -200,8 +200,7 @@ public class MvMetadataCache {
     MvFreshness freshness = freshnessStr != null
         ? MvFreshness.valueOf(freshnessStr) : MvFreshness.FRESH;
 
-    entry._coverageUpperMs = coverageUpperMs;
-    entry._freshness = freshness;
+    entry.setRuntimeState(coverageUpperMs, freshness);
   }
 
   // -----------------------------------------------------------------------
@@ -336,24 +335,34 @@ public class MvMetadataCache {
 
   /**
    * A cached entry holding the MV definition (with pre-compiled {@link PinotQuery})
-   * and volatile runtime scalars (coverageUpperMs, freshness).
+   * and a volatile atomic reference to runtime state (coverageUpperMs, freshness).
+   *
+   * <p>The two runtime scalars are grouped in an immutable {@link RuntimeState} record
+   * and published through a single {@code volatile} field to guarantee that readers
+   * always see a consistent (coverageUpperMs, freshness) pair — never a mix of values
+   * from different ZK updates.
    *
    * <p>The broker only needs {@code coverageUpperMs} (confirmed queryable data
    * boundary) and not the generator's scheduling watermark.
+   *
+   * <p>Thread-safety note: ZK listener mutations are synchronized on
+   * {@link ZkDefinitionListener}. Reads of the reverse index and entry map are
+   * unsynchronized; a transient window during definition updates may show both
+   * old and new entries for the same base table, but this is safe (worst case:
+   * a duplicate candidate is evaluated and discarded).
    */
   public static class MvCacheEntry {
     private final MvDefinitionMetadata _definition;
     private final PinotQuery _compiledQuery;
 
-    volatile long _coverageUpperMs;
-    volatile MvFreshness _freshness;
+    /** Immutable pair published atomically to avoid torn reads of the two runtime scalars. */
+    private volatile RuntimeState _runtimeState;
 
     public MvCacheEntry(MvDefinitionMetadata definition, @Nullable PinotQuery compiledQuery,
         long coverageUpperMs, MvFreshness freshness) {
       _definition = definition;
       _compiledQuery = compiledQuery;
-      _coverageUpperMs = coverageUpperMs;
-      _freshness = freshness;
+      _runtimeState = new RuntimeState(coverageUpperMs, freshness);
     }
 
     public MvDefinitionMetadata getDefinition() {
@@ -366,11 +375,26 @@ public class MvMetadataCache {
     }
 
     public long getCoverageUpperMs() {
-      return _coverageUpperMs;
+      return _runtimeState._coverageUpperMs;
     }
 
     public MvFreshness getFreshness() {
-      return _freshness;
+      return _runtimeState._freshness;
+    }
+
+    /** Atomically replaces both runtime scalars. */
+    void setRuntimeState(long coverageUpperMs, MvFreshness freshness) {
+      _runtimeState = new RuntimeState(coverageUpperMs, freshness);
+    }
+
+    private static final class RuntimeState {
+      final long _coverageUpperMs;
+      final MvFreshness _freshness;
+
+      RuntimeState(long coverageUpperMs, MvFreshness freshness) {
+        _coverageUpperMs = coverageUpperMs;
+        _freshness = freshness;
+      }
     }
 
     @Nullable

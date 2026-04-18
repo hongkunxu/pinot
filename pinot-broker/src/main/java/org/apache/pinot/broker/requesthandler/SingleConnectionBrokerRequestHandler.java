@@ -194,12 +194,13 @@ public class SingleConnectionBrokerRequestHandler extends BaseSingleStageBrokerR
 
     // Submit base-table and MV queries in parallel through the QueryRouter.
     // Each route may fan out to multiple servers (especially if the base table is hybrid).
-    // Using requestId for base and requestId+1 for MV to avoid key collision in the
-    // async response map.
+    // A fresh ID from the generator is used for the MV sub-query to avoid colliding with
+    // any concurrent request that may already hold requestId+1.
+    long mvRequestId = _requestIdGenerator.get();
     AsyncQueryResponse baseAsyncResponse =
         _queryRouter.submitQuery(requestId, rawTableName, baseRoute, timeoutMs);
     AsyncQueryResponse mvAsyncResponse =
-        _queryRouter.submitQuery(requestId + 1, rawTableName, mvRoute, timeoutMs);
+        _queryRouter.submitQuery(mvRequestId, rawTableName, mvRoute, timeoutMs);
 
     // Collect responses from both queries
     Map<ServerRoutingInstance, ServerResponse> baseFinalResponses = baseAsyncResponse.getFinalResponses();

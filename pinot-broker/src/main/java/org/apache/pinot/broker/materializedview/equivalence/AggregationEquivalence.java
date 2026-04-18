@@ -45,6 +45,28 @@ import org.apache.pinot.common.request.Function;
 public interface AggregationEquivalence {
 
   /**
+   * Returns {@code true} if this equivalence can be used in split-mode execution.
+   *
+   * <p>In split mode the base side returns intermediates for the original user
+   * aggregation function, while the MV side returns intermediates for the
+   * re-aggregation function. The broker reducer merges all DataTables using the
+   * original function's reducer. If the two functions produce incompatible
+   * intermediate types (e.g. COUNT produces LONG intermediates but SUM also
+   * produces LONG — however their DataTable column types may differ), split mode
+   * should be rejected.
+   *
+   * <p>An equivalence is split-safe when the re-aggregation function is identical
+   * to the user function (distributive functions: SUM, MIN, MAX) and the MV
+   * stores the same intermediate format. COUNT→SUM and sketch functions are NOT
+   * split-safe.
+   *
+   * @return {@code true} if this equivalence produces split-safe intermediates
+   */
+  default boolean isSplitSafe() {
+    return false;
+  }
+
+  /**
    * Returns {@code true} if this equivalence can handle the given combination
    * of user aggregation function and MV aggregation function.
    *

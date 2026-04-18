@@ -66,6 +66,15 @@ public class PassthroughEquivalence implements AggregationEquivalence {
   }
 
   @Override
+  public boolean isSplitSafe() {
+    // Split-safe only when re-aggregation uses the same function as the user query
+    // (distributive: SUM->SUM, MIN->MIN, MAX->MAX). COUNT->SUM is NOT split-safe
+    // because the base side returns COUNT intermediates but the MV side returns
+    // SUM intermediates, causing a schema mismatch in the broker reducer.
+    return _userFunctionName.equalsIgnoreCase(_reAggFunctionName);
+  }
+
+  @Override
   public boolean matches(String userFunctionName, String mvFunctionName) {
     return _userFunctionName.equalsIgnoreCase(userFunctionName)
         && _userFunctionName.equalsIgnoreCase(mvFunctionName);

@@ -259,6 +259,12 @@ public class AggregationSubsumptionStrategy extends AbstractSubsumptionStrategy 
     PinotQuery rewritten = userQuery.deepCopy();
     rewritten.getDataSource().setTableName(candidateEntry.getMvTableNameWithType());
 
+    // Check whether all re-aggregation rules applied to this query are split-safe
+    // (i.e. produce intermediates compatible with what the original function's reducer expects).
+    // COUNT->SUM is NOT split-safe: base side produces COUNT intermediates but MV side produces
+    // SUM intermediates, causing a schema mismatch in the broker reducer during split-mode merge.
+    boolean splitSafe = isSplitSafe(userQuery.getSelectList(), mvProjectionMap);
+
     rewritten.setSelectList(
         buildReAggSelectList(userQuery.getSelectList(), mvProjectionMap));
 
@@ -294,7 +300,29 @@ public class AggregationSubsumptionStrategy extends AbstractSubsumptionStrategy 
 
     double cost = filtersEqual ? COST_REAGG : COST_REAGG_WITH_RESIDUAL;
     return new MvRewritePlan(candidateEntry.getMvTableNameWithType(),
-        MatchType.AGG_REAGG, null, rewritten, null, cost);
+        MatchType.AGG_REAGG, null, rewritten, null, cost, splitSafe);
+  }
+
+  /**
+   * Returns true if all aggregation expressions in the SELECT list use split-safe
+   * equivalence rules (i.e. the re-aggregation function is identical to the user
+   * function, so intermediates from base and MV sides are schema-compatible).
+   */
+  private static boolean isSplitSafe(List<Expression> userSelectList,
+      Map<Expression, String> mvProjectionMap) {
+    for (Expression expr : userSelectList) {
+      Expression stripped = MvMatchUtils.stripAlias(expr);
+      if (stripped.getFunctionCall() != null && !mvProjectionMap.containsKey(stripped)) {
+        Object[] match = findEquivalentMvEntry(stripped, mvProjectionMap);
+        if (match != null) {
+          AggregationEquivalence rule = (AggregationEquivalence) match[1];
+          if (!rule.isSplitSafe()) {
+            return false;
+          }
+        }
+      }
+    }
+    return true;
   }
 
   private List<Expression> buildReAggSelectList(List<Expression> userSelectList,

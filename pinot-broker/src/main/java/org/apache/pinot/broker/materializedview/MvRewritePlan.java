@@ -52,16 +52,37 @@ public class MvRewritePlan implements Comparable<MvRewritePlan> {
   private final MvSplitSpec _splitSpec;
   private final long _coverageUpperMs;
 
+  /**
+   * Whether this plan can be used in SPLIT_REWRITE mode. False for AGG_REAGG
+   * plans that use non-distributive re-aggregation rules (e.g. COUNT->SUM)
+   * because the MV side produces intermediate types incompatible with what the
+   * base-side reducer expects.
+   */
+  private final boolean _splitSafe;
+
   public MvRewritePlan(String mvTableNameWithType, MatchType matchType,
       @Nullable ExecutionMode execMode, PinotQuery mvQuery,
       @Nullable PinotQuery baseQueryTemplate, double cost) {
-    this(mvTableNameWithType, matchType, execMode, mvQuery, baseQueryTemplate, cost, null, 0);
+    this(mvTableNameWithType, matchType, execMode, mvQuery, baseQueryTemplate, cost, null, 0, true);
+  }
+
+  public MvRewritePlan(String mvTableNameWithType, MatchType matchType,
+      @Nullable ExecutionMode execMode, PinotQuery mvQuery,
+      @Nullable PinotQuery baseQueryTemplate, double cost, boolean splitSafe) {
+    this(mvTableNameWithType, matchType, execMode, mvQuery, baseQueryTemplate, cost, null, 0, splitSafe);
   }
 
   public MvRewritePlan(String mvTableNameWithType, MatchType matchType,
       @Nullable ExecutionMode execMode, PinotQuery mvQuery,
       @Nullable PinotQuery baseQueryTemplate, double cost,
       @Nullable MvSplitSpec splitSpec, long coverageUpperMs) {
+    this(mvTableNameWithType, matchType, execMode, mvQuery, baseQueryTemplate, cost, splitSpec, coverageUpperMs, true);
+  }
+
+  public MvRewritePlan(String mvTableNameWithType, MatchType matchType,
+      @Nullable ExecutionMode execMode, PinotQuery mvQuery,
+      @Nullable PinotQuery baseQueryTemplate, double cost,
+      @Nullable MvSplitSpec splitSpec, long coverageUpperMs, boolean splitSafe) {
     _mvTableNameWithType = mvTableNameWithType;
     _matchType = matchType;
     _execMode = execMode;
@@ -70,6 +91,7 @@ public class MvRewritePlan implements Comparable<MvRewritePlan> {
     _cost = cost;
     _splitSpec = splitSpec;
     _coverageUpperMs = coverageUpperMs;
+    _splitSafe = splitSafe;
   }
 
   /**
@@ -79,7 +101,7 @@ public class MvRewritePlan implements Comparable<MvRewritePlan> {
   public MvRewritePlan withExecMode(ExecutionMode execMode, @Nullable PinotQuery baseQueryTemplate,
       @Nullable MvSplitSpec splitSpec, long coverageUpperMs) {
     return new MvRewritePlan(_mvTableNameWithType, _matchType, execMode,
-        _mvQuery, baseQueryTemplate, _cost, splitSpec, coverageUpperMs);
+        _mvQuery, baseQueryTemplate, _cost, splitSpec, coverageUpperMs, _splitSafe);
   }
 
   public String getMvTableNameWithType() {
@@ -115,6 +137,10 @@ public class MvRewritePlan implements Comparable<MvRewritePlan> {
 
   public long getCoverageUpperMs() {
     return _coverageUpperMs;
+  }
+
+  public boolean isSplitSafe() {
+    return _splitSafe;
   }
 
   @Override

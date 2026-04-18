@@ -18,6 +18,7 @@
  */
 package org.apache.pinot.broker.materializedview.strategy;
 
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -148,6 +149,21 @@ public class ExactSubsumptionStrategy extends AbstractSubsumptionStrategy {
     rewritten.getDataSource().setTableName(candidateEntry.getMvTableNameWithType());
     rewritten.setSelectList(MvMatchUtils.rewriteSelectList(userQuery.getSelectList(), mvProjectionMap));
     rewritten.setFilterExpression(null);
+    // Remap GROUP BY and ORDER BY from user column names to MV column names.
+    if (userQuery.getGroupByList() != null) {
+      List<Expression> remappedGroupBy = new ArrayList<>(userQuery.getGroupByList().size());
+      for (Expression expr : userQuery.getGroupByList()) {
+        remappedGroupBy.add(MvMatchUtils.remapExpression(expr, mvProjectionMap));
+      }
+      rewritten.setGroupByList(remappedGroupBy);
+    }
+    if (userQuery.getOrderByList() != null) {
+      List<Expression> remappedOrderBy = new ArrayList<>(userQuery.getOrderByList().size());
+      for (Expression expr : userQuery.getOrderByList()) {
+        remappedOrderBy.add(MvMatchUtils.remapExpression(expr, mvProjectionMap));
+      }
+      rewritten.setOrderByList(remappedOrderBy);
+    }
     return new MvRewritePlan(candidateEntry.getMvTableNameWithType(),
         MatchType.EXACT, null, rewritten, null, COST_EXACT);
   }

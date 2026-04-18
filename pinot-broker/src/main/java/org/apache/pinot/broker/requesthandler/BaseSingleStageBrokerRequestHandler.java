@@ -1213,21 +1213,35 @@ public abstract class BaseSingleStageBrokerRequestHandler extends BaseBrokerRequ
         MvRewritePlan plan = mvRewriteResult.getPlan();
 
         if (plan.getExecMode() == ExecutionMode.SPLIT_REWRITE) {
-          mvServerPinotQuery = plan.getMvQuery();
-          mvTableName = plan.getMvTableNameWithType();
-          mvRawTableName = TableNameBuilder.extractRawTableName(mvTableName);
-          mvSchema = _tableCache.getSchema(mvRawTableName);
+          String splitMvRawTableName = TableNameBuilder.extractRawTableName(plan.getMvTableNameWithType());
+          Schema splitMvSchema = _tableCache.getSchema(splitMvRawTableName);
+          if (splitMvSchema == null) {
+            LOGGER.warn("MV schema not found for {}; skipping SPLIT_REWRITE", plan.getMvTableNameWithType());
+            mvRewriteResult = null;
+          } else {
+            mvServerPinotQuery = plan.getMvQuery();
+            mvTableName = plan.getMvTableNameWithType();
+            mvRawTableName = splitMvRawTableName;
+            mvSchema = splitMvSchema;
+          }
         } else {
           // Preserve the original server query and table name so that access control
           // authorization and RLS filter lookups are performed against the base table,
           // not the MV that replaced it.
-          preRewriteServerPinotQuery = serverPinotQuery;
-          preRewriteTableName = tableName;
-          serverPinotQuery = plan.getMvQuery();
-          pinotQuery = serverPinotQuery;
-          tableName = plan.getMvTableNameWithType();
-          rawTableName = TableNameBuilder.extractRawTableName(tableName);
-          schema = _tableCache.getSchema(rawTableName);
+          String mvRawTableNameForFull = TableNameBuilder.extractRawTableName(plan.getMvTableNameWithType());
+          Schema mvSchemaForFull = _tableCache.getSchema(mvRawTableNameForFull);
+          if (mvSchemaForFull == null) {
+            LOGGER.warn("MV schema not found for {}; skipping FULL_REWRITE", plan.getMvTableNameWithType());
+            mvRewriteResult = null;
+          } else {
+            preRewriteServerPinotQuery = serverPinotQuery;
+            preRewriteTableName = tableName;
+            serverPinotQuery = plan.getMvQuery();
+            pinotQuery = serverPinotQuery;
+            tableName = plan.getMvTableNameWithType();
+            rawTableName = mvRawTableNameForFull;
+            schema = mvSchemaForFull;
+          }
         }
       }
     }
@@ -2349,6 +2363,7 @@ public abstract class BaseSingleStageBrokerRequestHandler extends BaseBrokerRequ
     if (baseRealtimeBrokerRequest != null && isFilterAlwaysFalse(baseRealtimeBrokerRequest.getPinotQuery())) {
       baseRealtimeBrokerRequest = null;
     }
+    // Cast is safe: prepareBaseTableRoute already verified the type with Preconditions.checkState.
     ((ImplicitHybridTableRouteInfo) baseRouteInfo).setOfflineBrokerRequest(baseOfflineBrokerRequest);
     ((ImplicitHybridTableRouteInfo) baseRouteInfo).setRealtimeBrokerRequest(baseRealtimeBrokerRequest);
 
@@ -2399,6 +2414,11 @@ public abstract class BaseSingleStageBrokerRequestHandler extends BaseBrokerRequ
    * routeInfo for the base table.
    */
   private void prepareBaseTableRoute(BrokerRequest baseBrokerRequest, TableRouteInfo baseRouteInfo, Schema schema) {
+    Preconditions.checkState(baseRouteInfo instanceof ImplicitHybridTableRouteInfo,
+        "MV split execution requires ImplicitHybridTableRouteInfo but got: %s",
+        baseRouteInfo.getClass().getSimpleName());
+    ImplicitHybridTableRouteInfo hybridRoute = (ImplicitHybridTableRouteInfo) baseRouteInfo;
+
     String offlineTableName = baseRouteInfo.getOfflineTableName();
     String realtimeTableName = baseRouteInfo.getRealtimeTableName();
     TimeBoundaryInfo timeBoundaryInfo = baseRouteInfo.getTimeBoundaryInfo();
@@ -2422,14 +2442,14 @@ public abstract class BaseSingleStageBrokerRequestHandler extends BaseBrokerRequ
       _queryOptimizer.optimize(realtimePinotQuery, schema);
       BrokerRequest realtimeBrokerRequest = CalciteSqlCompiler.convertToBrokerRequest(realtimePinotQuery);
 
-      ((ImplicitHybridTableRouteInfo) baseRouteInfo).setOfflineBrokerRequest(offlineBrokerRequest);
-      ((ImplicitHybridTableRouteInfo) baseRouteInfo).setRealtimeBrokerRequest(realtimeBrokerRequest);
+      hybridRoute.setOfflineBrokerRequest(offlineBrokerRequest);
+      hybridRoute.setRealtimeBrokerRequest(realtimeBrokerRequest);
     } else if (baseRouteInfo.isOffline()) {
       setTableName(baseBrokerRequest, offlineTableName);
-      ((ImplicitHybridTableRouteInfo) baseRouteInfo).setOfflineBrokerRequest(baseBrokerRequest);
+      hybridRoute.setOfflineBrokerRequest(baseBrokerRequest);
     } else {
       setTableName(baseBrokerRequest, realtimeTableName);
-      ((ImplicitHybridTableRouteInfo) baseRouteInfo).setRealtimeBrokerRequest(baseBrokerRequest);
+      hybridRoute.setRealtimeBrokerRequest(baseBrokerRequest);
     }
   }
 

@@ -207,6 +207,18 @@ public class MvQueryRewriteEngine {
         return null;
       }
 
+      // AGG_REAGG plans that use non-distributive re-aggregation (e.g. COUNT->SUM) are
+      // not split-safe: the base side produces COUNT intermediates while the MV side
+      // produces SUM intermediates, and the broker reducer (using the original COUNT
+      // function) will misinterpret the MV DataTables. Fall back to FULL_REWRITE.
+      if (!plan.isSplitSafe()) {
+        LOGGER.info("MV skip split [{}]: AGG_REAGG plan is not split-safe "
+                + "(non-distributive re-aggregation such as COUNT->SUM). "
+                + "Cannot use SPLIT_REWRITE; falling back to FULL_REWRITE.",
+            candidate.getMvTableNameWithType());
+        return plan.withExecMode(ExecutionMode.FULL_REWRITE, null, null, 0);
+      }
+
       PinotQuery baseQueryTemplate = userQuery.deepCopy();
       return plan.withExecMode(ExecutionMode.SPLIT_REWRITE, baseQueryTemplate,
           splitSpec, coverageUpperMs);
