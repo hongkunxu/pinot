@@ -104,25 +104,37 @@ public class ExactSubsumptionStrategy extends AbstractSubsumptionStrategy {
    * identical between the user query and the MV definition.
    */
   @Override
-  protected boolean validateResidual(@Nullable Expression residualFilter, PinotQuery mvQuery) {
+  protected boolean validateResidual(@Nullable Expression residualFilter, PinotQuery mvQuery,
+      Map<Expression, String> mvProjectionMap) {
     return residualFilter == null;
   }
 
   /**
-   * Requires ORDER BY lists to be identical between user query and MV query.
+   * Requires ORDER BY lists to be compatible between user query and MV query.
+   * If both have ORDER BY, they must be identical. If the user has ORDER BY but the MV
+   * does not (the common case — MVs rarely define ORDER BY), the check passes as long as
+   * all referenced columns are present in the MV projection, since the MV table can
+   * serve any ORDER BY over its columns.
    */
   @Override
   protected boolean orderByCompatible(PinotQuery userQuery, PinotQuery mvQuery,
       Map<Expression, String> mvProjectionMap) {
     List<Expression> userList = userQuery.getOrderByList();
     List<Expression> mvList = mvQuery.getOrderByList();
-    if (userList == null && mvList == null) {
+    if (userList == null || userList.isEmpty()) {
       return true;
     }
-    if (userList == null || mvList == null) {
-      return false;
+    if (mvList != null && !mvList.isEmpty()) {
+      return userList.equals(mvList);
     }
-    return userList.equals(mvList);
+    // MV has no ORDER BY — allow if all referenced columns are in the MV projection.
+    Set<String> mvColumns = Set.copyOf(mvProjectionMap.values());
+    for (Expression orderByExpr : userList) {
+      if (!mvColumns.containsAll(MvMatchUtils.collectReferencedColumns(orderByExpr))) {
+        return false;
+      }
+    }
+    return true;
   }
 
   /**

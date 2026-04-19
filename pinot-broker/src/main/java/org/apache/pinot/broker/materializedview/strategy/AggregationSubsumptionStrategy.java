@@ -174,7 +174,8 @@ public class AggregationSubsumptionStrategy extends AbstractSubsumptionStrategy 
   }
 
   @Override
-  protected boolean validateResidual(@Nullable Expression residualFilter, PinotQuery mvQuery) {
+  protected boolean validateResidual(@Nullable Expression residualFilter, PinotQuery mvQuery,
+      Map<Expression, String> mvProjectionMap) {
     if (residualFilter == null) {
       return true;
     }

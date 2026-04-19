@@ -67,6 +67,10 @@ public class MvMetadataCache {
   private final ZkHelixPropertyStore<ZNRecord> _propertyStore;
   private final ZkDefinitionListener _definitionListener = new ZkDefinitionListener();
   private final ZkRuntimeListener _runtimeListener = new ZkRuntimeListener();
+  // Shared lock so that definition and runtime listener callbacks are mutually exclusive,
+  // preventing a concurrent putDefinitionEntry from overwriting a runtime update that arrived
+  // between the _mvEntryMap.get and _mvEntryMap.put in putDefinitionEntry.
+  private final Object _cacheLock = new Object();
 
   private final Map<String, MvCacheEntry> _mvEntryMap = new ConcurrentHashMap<>();
   private final Map<String, List<MvCacheEntry>> _baseTableToMvMap = new ConcurrentHashMap<>();
@@ -74,7 +78,7 @@ public class MvMetadataCache {
   public MvMetadataCache(ZkHelixPropertyStore<ZNRecord> propertyStore) {
     _propertyStore = propertyStore;
 
-    synchronized (_definitionListener) {
+    synchronized (_cacheLock) {
       _propertyStore.subscribeChildChanges(MV_DEFINITION_PARENT_PATH, _definitionListener);
       _propertyStore.subscribeChildChanges(MV_RUNTIME_PARENT_PATH, _runtimeListener);
 
@@ -242,7 +246,8 @@ public class MvMetadataCache {
 
   private class ZkDefinitionListener implements IZkChildListener, IZkDataListener {
     @Override
-    public synchronized void handleChildChange(String path, List<String> children) {
+    public void handleChildChange(String path, List<String> children) {
+      synchronized (_cacheLock) {
       Set<String> newChildSet = CollectionUtils.isNotEmpty(children)
           ? new HashSet<>(children) : Collections.emptySet();
 
@@ -266,10 +271,12 @@ public class MvMetadataCache {
         addDefinitions(defPathsToAdd);
         loadRuntimeStates(rtPathsToAdd);
       }
+      }
     }
 
     @Override
-    public synchronized void handleDataChange(String path, Object data) {
+    public void handleDataChange(String path, Object data) {
+      synchronized (_cacheLock) {
       if (data != null) {
         try {
           putDefinitionEntry((ZNRecord) data);
@@ -277,17 +284,21 @@ public class MvMetadataCache {
           LOGGER.error("Failed to refresh MV definition for: {}", path, e);
         }
       }
+      }
     }
 
     @Override
-    public synchronized void handleDataDeleted(String path) {
+    public void handleDataDeleted(String path) {
+      synchronized (_cacheLock) {
       removeDefinitionEntry(path);
+      }
     }
   }
 
   private class ZkRuntimeListener implements IZkChildListener, IZkDataListener {
     @Override
-    public synchronized void handleChildChange(String path, List<String> children) {
+    public void handleChildChange(String path, List<String> children) {
+      synchronized (_cacheLock) {
       Set<String> newChildSet = CollectionUtils.isNotEmpty(children)
           ? new HashSet<>(children) : Collections.emptySet();
 
@@ -308,24 +319,29 @@ public class MvMetadataCache {
       if (!rtPathsToAdd.isEmpty()) {
         loadRuntimeStates(rtPathsToAdd);
       }
+      }
     }
 
     @Override
-    public synchronized void handleDataChange(String path, Object data) {
-      if (data != null) {
-        try {
-          updateRuntimeState((ZNRecord) data);
-        } catch (Exception e) {
-          LOGGER.error("Failed to refresh MV runtime for: {}", path, e);
+    public void handleDataChange(String path, Object data) {
+      synchronized (_cacheLock) {
+        if (data != null) {
+          try {
+            updateRuntimeState((ZNRecord) data);
+          } catch (Exception e) {
+            LOGGER.error("Failed to refresh MV runtime for: {}", path, e);
+          }
         }
       }
     }
 
     @Override
-    public synchronized void handleDataDeleted(String path) {
-      // Runtime deletion is handled when the definition is deleted;
-      // just unsubscribe.
-      _propertyStore.unsubscribeDataChanges(path, _runtimeListener);
+    public void handleDataDeleted(String path) {
+      synchronized (_cacheLock) {
+        // Runtime deletion is handled when the definition is deleted;
+        // just unsubscribe.
+        _propertyStore.unsubscribeDataChanges(path, _runtimeListener);
+      }
     }
   }
 

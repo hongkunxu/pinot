@@ -1213,16 +1213,22 @@ public abstract class BaseSingleStageBrokerRequestHandler extends BaseBrokerRequ
         MvRewritePlan plan = mvRewriteResult.getPlan();
 
         if (plan.getExecMode() == ExecutionMode.SPLIT_REWRITE) {
-          String splitMvRawTableName = TableNameBuilder.extractRawTableName(plan.getMvTableNameWithType());
-          Schema splitMvSchema = _tableCache.getSchema(splitMvRawTableName);
-          if (splitMvSchema == null) {
-            LOGGER.warn("MV schema not found for {}; skipping SPLIT_REWRITE", plan.getMvTableNameWithType());
+          if (!supportsMvSplitRewrite()) {
+            LOGGER.debug("Handler does not support SPLIT_REWRITE; skipping for MV {}",
+                plan.getMvTableNameWithType());
             mvRewriteResult = null;
           } else {
-            mvServerPinotQuery = plan.getMvQuery();
-            mvTableName = plan.getMvTableNameWithType();
-            mvRawTableName = splitMvRawTableName;
-            mvSchema = splitMvSchema;
+            String splitMvRawTableName = TableNameBuilder.extractRawTableName(plan.getMvTableNameWithType());
+            Schema splitMvSchema = _tableCache.getSchema(splitMvRawTableName);
+            if (splitMvSchema == null) {
+              LOGGER.warn("MV schema not found for {}; skipping SPLIT_REWRITE", plan.getMvTableNameWithType());
+              mvRewriteResult = null;
+            } else {
+              mvServerPinotQuery = plan.getMvQuery();
+              mvTableName = plan.getMvTableNameWithType();
+              mvRawTableName = splitMvRawTableName;
+              mvSchema = splitMvSchema;
+            }
           }
         } else {
           // Preserve the original server query and table name so that access control
@@ -2506,6 +2512,17 @@ public abstract class BaseSingleStageBrokerRequestHandler extends BaseBrokerRequ
       BrokerRequest serverBrokerRequest, TableRouteInfo route, long timeoutMs,
       ServerStats serverStats, RequestContext requestContext)
       throws Exception;
+
+  /**
+   * Returns {@code true} if this handler supports MV SPLIT_REWRITE execution (dual scatter-gather
+   * to base table + MV, then merge). Subclasses that do not support merging results from two
+   * independent routes (e.g. gRPC streaming) should override this to return {@code false}.
+   * When {@code false}, SPLIT_REWRITE plans are suppressed at compile time and the query either
+   * falls back to FULL_REWRITE (if eligible) or executes against the base table unchanged.
+   */
+  protected boolean supportsMvSplitRewrite() {
+    return true;
+  }
 
   /**
    * Processes an MV-split query by issuing two independent scatter-gather requests — one to the

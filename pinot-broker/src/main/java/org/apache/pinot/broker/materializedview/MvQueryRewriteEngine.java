@@ -125,7 +125,7 @@ public class MvQueryRewriteEngine {
           bestPlan.getMatchType(), bestPlan.getExecMode(), bestPlan.getCost(),
           pinotQuery, bestPlan.getMvQuery());
     } else {
-      LOGGER.info("MV rewrite miss for table [{}]: evaluated {} candidate(s)={}, "
+      LOGGER.debug("MV rewrite miss for table [{}]: evaluated {} candidate(s)={}, "
               + "queryShape={}, userQuery=[{}]",
           rawBaseTableName, candidates.size(), candidateNames,
           MvQueryShape.classify(pinotQuery), pinotQuery);
@@ -145,7 +145,7 @@ public class MvQueryRewriteEngine {
   private static boolean isEligible(MvMetadataCache.MvCacheEntry candidate) {
     MvFreshness freshness = candidate.getFreshness();
     if (freshness != MvFreshness.FRESH) {
-      LOGGER.info("MV skip [{}]: freshness={} (requires FRESH)",
+      LOGGER.debug("MV skip [{}]: freshness={} (requires FRESH)",
           candidate.getMvTableNameWithType(), freshness);
       return false;
     }

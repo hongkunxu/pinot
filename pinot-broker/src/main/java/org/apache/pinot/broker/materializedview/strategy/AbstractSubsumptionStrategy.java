@@ -130,7 +130,7 @@ public abstract class AbstractSubsumptionStrategy implements MvMatchStrategy {
     }
 
     // Step 5: residual validation (subclass-specific)
-    if (!validateResidual(residualFilter, mvQuery)) {
+    if (!validateResidual(residualFilter, mvQuery, mvProjectionMap)) {
       LOGGER.debug("MV match [{}] strategy={}: rejected at RESIDUAL_VALIDATION", mvName, strategyName);
       return null;
     }
@@ -180,8 +180,13 @@ public abstract class AbstractSubsumptionStrategy implements MvMatchStrategy {
   /**
    * Returns {@code true} if the residual filter (extra WHERE predicates beyond
    * the MV's definition) is valid for this strategy.
+   *
+   * @param residualFilter  the residual WHERE filter, or {@code null} if filters are identical
+   * @param mvQuery         the MV's compiled query
+   * @param mvProjectionMap alias-stripped expression &rarr; MV column name (already computed by caller)
    */
-  protected abstract boolean validateResidual(@Nullable Expression residualFilter, PinotQuery mvQuery);
+  protected abstract boolean validateResidual(@Nullable Expression residualFilter, PinotQuery mvQuery,
+      Map<Expression, String> mvProjectionMap);
 
   /**
    * Returns {@code true} if the user query's ORDER BY clause can be satisfied

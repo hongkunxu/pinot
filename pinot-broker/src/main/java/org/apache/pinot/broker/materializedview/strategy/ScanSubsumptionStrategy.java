@@ -19,7 +19,6 @@
 package org.apache.pinot.broker.materializedview.strategy;
 
 import java.util.ArrayList;
-import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -80,13 +79,13 @@ public class ScanSubsumptionStrategy extends AbstractSubsumptionStrategy {
   }
 
   @Override
-  protected boolean validateResidual(@Nullable Expression residualFilter, PinotQuery mvQuery) {
+  protected boolean validateResidual(@Nullable Expression residualFilter, PinotQuery mvQuery,
+      Map<Expression, String> mvProjectionMap) {
     if (residualFilter == null) {
       return true;
     }
     Set<String> residualColumns = MvMatchUtils.collectReferencedColumns(residualFilter);
-    Collection<String> mvColumns = MvMatchUtils.buildMvProjectionMap(mvQuery).values();
-    return mvColumns.containsAll(residualColumns);
+    return mvProjectionMap.values().containsAll(residualColumns);
   }
 
   @Override
