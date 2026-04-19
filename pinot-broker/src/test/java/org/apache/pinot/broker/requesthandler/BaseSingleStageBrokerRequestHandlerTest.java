@@ -124,7 +124,7 @@ public class BaseSingleStageBrokerRequestHandlerTest {
     BaseSingleStageBrokerRequestHandler handler =
         new BaseSingleStageBrokerRequestHandler(config, "testBrokerId", new BrokerRequestIdGenerator(),
             mock(org.apache.pinot.core.routing.RoutingManager.class), new AllowAllAccessControlFactory(),
-            queryQuotaManager, tableCache, ThreadAccountantUtils.getNoOpAccountant(), null) {
+            queryQuotaManager, tableCache, ThreadAccountantUtils.getNoOpAccountant(), null, null) {
           @Override
           public void start() {
           }
@@ -137,6 +137,13 @@ public class BaseSingleStageBrokerRequestHandlerTest {
           protected BrokerResponseNative processBrokerRequest(long requestId, BrokerRequest originalBrokerRequest,
               BrokerRequest serverBrokerRequest, TableRouteInfo route, long timeoutMs, ServerStats serverStats,
               RequestContext requestContext) {
+            return new BrokerResponseNative();
+          }
+
+          @Override
+          protected BrokerResponseNative processMvSplitBrokerRequest(long requestId,
+              BrokerRequest originalBrokerRequest, TableRouteInfo baseRoute, TableRouteInfo mvRoute,
+              long timeoutMs, ServerStats serverStats, RequestContext requestContext) {
             return new BrokerResponseNative();
           }
 

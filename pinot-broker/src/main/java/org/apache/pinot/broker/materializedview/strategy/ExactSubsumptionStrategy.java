@@ -164,6 +164,9 @@ public class ExactSubsumptionStrategy extends AbstractSubsumptionStrategy {
       }
       rewritten.setOrderByList(remappedOrderBy);
     }
+    if (userQuery.getHavingExpression() != null) {
+      rewritten.setHavingExpression(MvMatchUtils.remapExpression(userQuery.getHavingExpression(), mvProjectionMap));
+    }
     return new MvRewritePlan(candidateEntry.getMvTableNameWithType(),
         MatchType.EXACT, null, rewritten, null, COST_EXACT);
   }

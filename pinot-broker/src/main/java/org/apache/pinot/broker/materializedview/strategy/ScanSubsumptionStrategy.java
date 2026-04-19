@@ -18,6 +18,7 @@
  */
 package org.apache.pinot.broker.materializedview.strategy;
 
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
@@ -121,6 +122,13 @@ public class ScanSubsumptionStrategy extends AbstractSubsumptionStrategy {
     Expression remappedResidual = residualFilter != null
         ? MvMatchUtils.remapExpression(residualFilter, mvProjectionMap) : null;
     rewritten.setFilterExpression(remappedResidual);
+    if (userQuery.getOrderByList() != null && !userQuery.getOrderByList().isEmpty()) {
+      List<Expression> remappedOrderBy = new ArrayList<>(userQuery.getOrderByList().size());
+      for (Expression orderByExpr : userQuery.getOrderByList()) {
+        remappedOrderBy.add(MvMatchUtils.remapExpression(orderByExpr, mvProjectionMap));
+      }
+      rewritten.setOrderByList(remappedOrderBy);
+    }
 
     double cost = filtersEqual ? COST_SCAN_SUBSUMPTION : COST_SCAN_WITH_RESIDUAL;
     return new MvRewritePlan(candidateEntry.getMvTableNameWithType(),
