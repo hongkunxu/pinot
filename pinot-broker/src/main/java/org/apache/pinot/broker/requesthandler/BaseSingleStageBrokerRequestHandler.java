@@ -2396,10 +2396,11 @@ public abstract class BaseSingleStageBrokerRequestHandler extends BaseBrokerRequ
     // passes this request to BrokerReduceService as the serverBrokerRequest, the reducer
     // would build a QueryContext with isServerReturnFinalResult() == true and attempt to
     // cast intermediate objects (e.g. HyperLogLog) to Comparable, causing a ClassCastException.
-    // Remove the flag so the reducer uses the intermediate-result merge path.
-    originalBrokerRequest.getPinotQuery().getQueryOptions()
+    // Deep-copy so the mutation does not leak back to callers that hold the original reference.
+    BrokerRequest reduceBrokerRequest = originalBrokerRequest.deepCopy();
+    reduceBrokerRequest.getPinotQuery().getQueryOptions()
         .remove(QueryOptionKey.SERVER_RETURN_FINAL_RESULT);
-    originalBrokerRequest.getPinotQuery().getQueryOptions()
+    reduceBrokerRequest.getPinotQuery().getQueryOptions()
         .remove(QueryOptionKey.SERVER_RETURN_FINAL_RESULT_KEY_UNPARTITIONED);
 
     String baseRouteType = baseRouteInfo.isHybrid() ? "HYBRID" : (baseRouteInfo.isOffline() ? "OFFLINE" : "REALTIME");
@@ -2409,7 +2410,7 @@ public abstract class BaseSingleStageBrokerRequestHandler extends BaseBrokerRequ
         convertedTimeValue, baseTimeColumn,
         baseRouteInfo.getOfflineBrokerRequest() != null, baseRouteInfo.getRealtimeBrokerRequest() != null);
 
-    return processMvSplitBrokerRequest(requestId, originalBrokerRequest,
+    return processMvSplitBrokerRequest(requestId, reduceBrokerRequest,
         baseRouteInfo, mvRouteInfo, remainingTimeMs, serverStats, requestContext);
   }
 

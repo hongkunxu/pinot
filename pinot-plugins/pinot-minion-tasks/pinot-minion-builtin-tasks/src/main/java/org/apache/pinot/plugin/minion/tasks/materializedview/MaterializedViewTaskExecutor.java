@@ -88,9 +88,6 @@ public class MaterializedViewTaskExecutor extends BaseTaskExecutor {
   private final MinionConf _minionConf;
   private final MvQueryExecutor _queryExecutor;
 
-  /// CAS version for MvRuntimeMetadata. Set during preProcess.
-  private int _runtimeExpectedVersion = Integer.MIN_VALUE;
-
   public MaterializedViewTaskExecutor(MinionTaskZkMetadataManager minionTaskZkMetadataManager,
       MinionConf minionConf, MvQueryExecutor queryExecutor) {
     _minionTaskZkMetadataManager = minionTaskZkMetadataManager;
@@ -112,8 +109,6 @@ public class MaterializedViewTaskExecutor extends BaseTaskExecutor {
         propertyStore, tableName, stat);
 
     if (runtime != null) {
-      _runtimeExpectedVersion = stat.getVersion();
-
       if (MaterializedViewTask.TASK_MODE_APPEND.equals(taskMode)) {
         Preconditions.checkState(runtime.getWatermarkMs() <= windowStartMs,
             "watermarkMs %d should not be larger than windowStartMs %d for table %s",
@@ -131,7 +126,6 @@ public class MaterializedViewTaskExecutor extends BaseTaskExecutor {
       }
     } else {
       LOGGER.warn("MvRuntimeMetadata for table: {} not found; will be initialized in postProcess", tableName);
-      _runtimeExpectedVersion = -1;
     }
   }
 
@@ -380,72 +374,91 @@ public class MaterializedViewTaskExecutor extends BaseTaskExecutor {
    *   <li>coverageUpperMs: advance on APPEND only (broker query coverage)</li>
    * </ul>
    */
+  private static final int MAX_RUNTIME_UPDATE_ATTEMPTS = 3;
+
   private void updateMvRuntime(Map<String, String> configs, String tableName,
       String taskMode, long windowStartMs, long windowEndMs) {
     HelixPropertyStore<ZNRecord> propertyStore = MINION_CONTEXT.getHelixPropertyStore();
-    // Re-fetch with version at write time to avoid overwriting concurrent ConsistencyManager
-    // updates (e.g. STALE markings) that arrived after preProcess captured _runtimeExpectedVersion.
-    org.apache.zookeeper.data.Stat freshStat = new org.apache.zookeeper.data.Stat();
-    MvRuntimeMetadata existing = MvRuntimeMetadataUtils.fetchWithVersion(propertyStore, tableName, freshStat);
-    int writeVersion = (existing != null) ? freshStat.getVersion() : -1;
 
-    Map<Long, PartitionInfo> mergedInfos;
-    long existingWatermarkMs;
-    long existingCoverageUpperMs;
+    Exception lastException = null;
+    for (int attempt = 0; attempt < MAX_RUNTIME_UPDATE_ATTEMPTS; attempt++) {
+      if (attempt > 0) {
+        LOGGER.warn("Retrying MV runtime update for table: {} (attempt {}/{})", tableName, attempt + 1,
+            MAX_RUNTIME_UPDATE_ATTEMPTS);
+      }
+      try {
+        // Re-fetch with version on every attempt to pick up concurrent ConsistencyManager
+        // updates (e.g. STALE markings) that may have arrived since the previous attempt.
+        org.apache.zookeeper.data.Stat freshStat = new org.apache.zookeeper.data.Stat();
+        MvRuntimeMetadata existing = MvRuntimeMetadataUtils.fetchWithVersion(propertyStore, tableName, freshStat);
+        int writeVersion = (existing != null) ? freshStat.getVersion() : -1;
 
-    if (existing != null) {
-      mergedInfos = new HashMap<>(existing.getPartitions());
-      existingWatermarkMs = existing.getWatermarkMs();
-      existingCoverageUpperMs = existing.getCoverageUpperMs();
-    } else {
-      mergedInfos = new HashMap<>();
-      existingWatermarkMs = 0L;
-      existingCoverageUpperMs = 0L;
+        Map<Long, PartitionInfo> mergedInfos;
+        long existingWatermarkMs;
+        long existingCoverageUpperMs;
+
+        if (existing != null) {
+          mergedInfos = new HashMap<>(existing.getPartitions());
+          existingWatermarkMs = existing.getWatermarkMs();
+          existingCoverageUpperMs = existing.getCoverageUpperMs();
+        } else {
+          mergedInfos = new HashMap<>();
+          existingWatermarkMs = 0L;
+          existingCoverageUpperMs = 0L;
+        }
+
+        long newWatermarkMs;
+        long newCoverageUpperMs;
+
+        if (MaterializedViewTask.TASK_MODE_DELETE.equals(taskMode)) {
+          mergedInfos.remove(windowStartMs);
+          newWatermarkMs = existingWatermarkMs;
+          newCoverageUpperMs = existingCoverageUpperMs;
+          LOGGER.info("DELETE mode: removed partition {} from MV runtime for table: {}", windowStartMs, tableName);
+        } else {
+          PartitionFingerprint newFingerprint = null;
+          String fingerprintStr = configs.get(MaterializedViewTask.PARTITION_FINGERPRINTS_KEY);
+          if (fingerprintStr != null && !fingerprintStr.isEmpty()) {
+            Map<Long, PartitionFingerprint> taskFingerprints = PartitionFingerprint.decodeMap(fingerprintStr);
+            newFingerprint = taskFingerprints.get(windowStartMs);
+          }
+          if (newFingerprint == null) {
+            newFingerprint = new PartitionFingerprint(0, 0);
+          }
+          long nowMs = System.currentTimeMillis();
+          PartitionInfo completedInfo = new PartitionInfo(PartitionState.VALID, newFingerprint, nowMs);
+          mergedInfos.put(windowStartMs, completedInfo);
+          LOGGER.info("Set partition {} to VALID (lastRefreshTime={}) for table: {}", windowStartMs, nowMs, tableName);
+
+          if (MaterializedViewTask.TASK_MODE_APPEND.equals(taskMode)) {
+            newWatermarkMs = windowEndMs;
+            newCoverageUpperMs = windowEndMs;
+            LOGGER.info("APPEND mode: advancing watermarkMs from {} to {}, coverageUpperMs from {} to {} for table: {}",
+                existingWatermarkMs, newWatermarkMs, existingCoverageUpperMs, newCoverageUpperMs, tableName);
+          } else {
+            newWatermarkMs = existingWatermarkMs;
+            newCoverageUpperMs = existingCoverageUpperMs;
+            LOGGER.info("OVERWRITE mode: keeping watermarkMs at {}, coverageUpperMs at {} for table: {}",
+                newWatermarkMs, newCoverageUpperMs, tableName);
+          }
+        }
+
+        MvFreshness freshness = MvRuntimeMetadata.computeFreshness(mergedInfos);
+        MvRuntimeMetadata updated = new MvRuntimeMetadata(
+            tableName, newWatermarkMs, newCoverageUpperMs, freshness, mergedInfos);
+        MvRuntimeMetadataUtils.persist(propertyStore, updated, writeVersion);
+
+        LOGGER.info("Updated MV runtime for table: {} (partitions={}, watermarkMs={}, coverageUpperMs={})",
+            tableName, mergedInfos.size(), newWatermarkMs, newCoverageUpperMs);
+        return;
+      } catch (Exception e) {
+        lastException = e;
+        LOGGER.warn("Failed to update MV runtime for table: {} on attempt {}", tableName, attempt + 1, e);
+      }
     }
-
-    long newWatermarkMs;
-    long newCoverageUpperMs;
-
-    if (MaterializedViewTask.TASK_MODE_DELETE.equals(taskMode)) {
-      mergedInfos.remove(windowStartMs);
-      newWatermarkMs = existingWatermarkMs;
-      newCoverageUpperMs = existingCoverageUpperMs;
-      LOGGER.info("DELETE mode: removed partition {} from MV runtime for table: {}", windowStartMs, tableName);
-    } else {
-      PartitionFingerprint newFingerprint = null;
-      String fingerprintStr = configs.get(MaterializedViewTask.PARTITION_FINGERPRINTS_KEY);
-      if (fingerprintStr != null && !fingerprintStr.isEmpty()) {
-        Map<Long, PartitionFingerprint> taskFingerprints = PartitionFingerprint.decodeMap(fingerprintStr);
-        newFingerprint = taskFingerprints.get(windowStartMs);
-      }
-      if (newFingerprint == null) {
-        newFingerprint = new PartitionFingerprint(0, 0);
-      }
-      long nowMs = System.currentTimeMillis();
-      PartitionInfo completedInfo = new PartitionInfo(PartitionState.VALID, newFingerprint, nowMs);
-      mergedInfos.put(windowStartMs, completedInfo);
-      LOGGER.info("Set partition {} to VALID (lastRefreshTime={}) for table: {}", windowStartMs, nowMs, tableName);
-
-      if (MaterializedViewTask.TASK_MODE_APPEND.equals(taskMode)) {
-        newWatermarkMs = windowEndMs;
-        newCoverageUpperMs = windowEndMs;
-        LOGGER.info("APPEND mode: advancing watermarkMs from {} to {}, coverageUpperMs from {} to {} for table: {}",
-            existingWatermarkMs, newWatermarkMs, existingCoverageUpperMs, newCoverageUpperMs, tableName);
-      } else {
-        newWatermarkMs = existingWatermarkMs;
-        newCoverageUpperMs = existingCoverageUpperMs;
-        LOGGER.info("OVERWRITE mode: keeping watermarkMs at {}, coverageUpperMs at {} for table: {}",
-            newWatermarkMs, newCoverageUpperMs, tableName);
-      }
-    }
-
-    MvFreshness freshness = MvRuntimeMetadata.computeFreshness(mergedInfos);
-    MvRuntimeMetadata updated = new MvRuntimeMetadata(
-        tableName, newWatermarkMs, newCoverageUpperMs, freshness, mergedInfos);
-    MvRuntimeMetadataUtils.persist(propertyStore, updated, writeVersion);
-
-    LOGGER.info("Updated MV runtime for table: {} (partitions={}, watermarkMs={}, coverageUpperMs={})",
-        tableName, mergedInfos.size(), newWatermarkMs, newCoverageUpperMs);
+    throw new RuntimeException(
+        "Failed to update MV runtime for table: " + tableName + " after " + MAX_RUNTIME_UPDATE_ATTEMPTS + " attempts",
+        lastException);
   }
 
   @Override

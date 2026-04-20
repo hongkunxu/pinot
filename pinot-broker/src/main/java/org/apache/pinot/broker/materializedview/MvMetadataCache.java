@@ -202,7 +202,7 @@ public class MvMetadataCache {
     }
     String freshnessStr = znRecord.getSimpleField("freshness");
     MvFreshness freshness = freshnessStr != null
-        ? MvFreshness.valueOf(freshnessStr) : MvFreshness.FRESH;
+        ? MvFreshness.valueOf(freshnessStr) : MvFreshness.STALE;
 
     entry.setRuntimeState(coverageUpperMs, freshness);
   }

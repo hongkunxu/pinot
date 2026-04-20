@@ -401,7 +401,15 @@ public class MaterializedViewTaskGenerator extends BaseTaskGenerator {
    * trailing semicolon.
    */
   static String appendTimeRange(String sql, String timeColumn, String windowStart, String windowEnd) {
-    String timeFilter = timeColumn + " >= " + windowStart + " AND " + timeColumn + " < " + windowEnd;
+    // Validate column name to prevent SQL injection (column names must be simple identifiers).
+    Preconditions.checkArgument(timeColumn.matches("[A-Za-z_][A-Za-z0-9_.]*"),
+        "Time column name contains invalid characters: %s", timeColumn);
+    // windowStart/windowEnd values come from DateTimeFormatSpec.fromMillisToFormat which may produce
+    // epoch-numeric strings (safe as-is) or date strings (must be quoted so the SQL parser treats
+    // them as string literals rather than unquoted expressions that could be misinterpreted).
+    String quotedStart = isNumeric(windowStart) ? windowStart : "'" + windowStart + "'";
+    String quotedEnd = isNumeric(windowEnd) ? windowEnd : "'" + windowEnd + "'";
+    String timeFilter = timeColumn + " >= " + quotedStart + " AND " + timeColumn + " < " + quotedEnd;
 
     // Remove trailing semicolon for easier manipulation
     String trimmed = sql.trim();
@@ -438,6 +446,19 @@ public class MaterializedViewTaskGenerator extends BaseTaskGenerator {
       return trimmed;
     }
     return trimmed + " LIMIT " + defaultLimit;
+  }
+
+  private static boolean isNumeric(String value) {
+    if (value == null || value.isEmpty()) {
+      return false;
+    }
+    for (int i = 0; i < value.length(); i++) {
+      char c = value.charAt(i);
+      if (!Character.isDigit(c) && c != '-' && c != '.') {
+        return false;
+      }
+    }
+    return true;
   }
 
   /**
