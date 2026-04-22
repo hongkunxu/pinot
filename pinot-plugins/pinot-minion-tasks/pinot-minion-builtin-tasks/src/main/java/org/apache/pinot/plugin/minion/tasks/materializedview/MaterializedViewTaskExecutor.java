@@ -168,6 +168,13 @@ public class MaterializedViewTaskExecutor extends BaseTaskExecutor {
     List<GenericRow> rows = convertToGenericRows(queryResult.getDataSchema(), queryResult.getRows());
     LOGGER.info("Query returned {} rows for table: {}", rows.size(), tableName);
 
+    // Completeness gate: reject windows whose result set saturated the declared LIMIT.  We must
+    // fail BEFORE building segments or calling postProcess, so neither the partition is marked
+    // VALID nor coverageUpperMs is advanced.  The task will be retried by Helix; a permanently
+    // over-sized window will require the operator to raise MAX_MV_QUERY_LIMIT or narrow the
+    // bucket / filters in definedSQL.
+    verifyResultNotTruncated(configs, tableName, windowStartMs, windowEndMs, rows.size());
+
     if (rows.isEmpty()) {
       LOGGER.info("No data returned for window [{}, {}) of table: {}. "
           + "Skipping segment creation and advancing watermark.", windowStartMs, windowEndMs, tableName);
@@ -466,6 +473,55 @@ public class MaterializedViewTaskExecutor extends BaseTaskExecutor {
       PinotTaskConfig pinotTaskConfig, SegmentConversionResult segmentConversionResult) {
     return new SegmentZKMetadataCustomMapModifier(
         SegmentZKMetadataCustomMapModifier.ModifyMode.UPDATE, Collections.emptyMap());
+  }
+
+  /**
+   * Fails the task if the query result set saturated the declared {@code LIMIT}, since that
+   * strongly suggests the window was truncated and the resulting MV would be incomplete.
+   *
+   * <p>Throwing here (before any segment build or {@code postProcess}) ensures:
+   * <ul>
+   *   <li>the partition is NOT marked {@link PartitionState#VALID};</li>
+   *   <li>{@code coverageUpperMs} is NOT advanced, so the broker will not rewrite subsequent
+   *       queries against the incomplete MV;</li>
+   *   <li>Helix retries the task, letting transient causes self-heal.</li>
+   * </ul>
+   *
+   * <p>If the config is missing (older tasks in flight during rolling upgrade), we WARN and let
+   * the task proceed — back-compat over a narrow upgrade window. Steady-state tasks always carry
+   * {@code EFFECTIVE_LIMIT_KEY}.
+   */
+  @VisibleForTesting
+  static void verifyResultNotTruncated(Map<String, String> configs, String tableName,
+      long windowStartMs, long windowEndMs, int actualRows) {
+    String limitStr = configs.get(MaterializedViewTask.EFFECTIVE_LIMIT_KEY);
+    if (limitStr == null || limitStr.isEmpty()) {
+      LOGGER.warn("MvRuntime completeness check skipped for table: {} window [{}, {}): "
+              + "missing {} in task config (likely a pre-upgrade task). Future tasks will enforce.",
+          tableName, windowStartMs, windowEndMs, MaterializedViewTask.EFFECTIVE_LIMIT_KEY);
+      return;
+    }
+    int effectiveLimit;
+    try {
+      effectiveLimit = Integer.parseInt(limitStr);
+    } catch (NumberFormatException e) {
+      throw new IllegalStateException(
+          "Invalid " + MaterializedViewTask.EFFECTIVE_LIMIT_KEY + " '" + limitStr
+              + "' in task config for table: " + tableName, e);
+    }
+    Preconditions.checkState(effectiveLimit > 0,
+        "effectiveLimit must be positive for table: %s, got: %s", tableName, effectiveLimit);
+
+    if (actualRows >= effectiveLimit) {
+      String message = String.format(
+          "MV result saturated LIMIT: table=%s, window=[%d, %d), rows=%d, LIMIT=%d. "
+              + "The materialized window is likely incomplete; failing the task to prevent "
+              + "advancing coverageUpperMs with truncated data. Narrow the time bucket / "
+              + "filters in definedSQL, or raise MAX_MV_QUERY_LIMIT and redefine the MV.",
+          tableName, windowStartMs, windowEndMs, actualRows, effectiveLimit);
+      LOGGER.warn(message);
+      throw new IllegalStateException(message);
+    }
   }
 
   /**

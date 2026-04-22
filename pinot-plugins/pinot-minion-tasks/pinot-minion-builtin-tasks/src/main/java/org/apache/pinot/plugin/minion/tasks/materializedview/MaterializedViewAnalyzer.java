@@ -87,6 +87,11 @@ public final class MaterializedViewAnalyzer {
     // Step 1: SQL syntax and Pinot semantic validation
     PinotQuery pinotQuery = validateSqlSyntax(definedSql);
 
+    // Step 1b: require a bounded, explicit LIMIT so the executor can detect truncation.
+    // A silent default (e.g. 1M) would let an over-sized window be marked VALID and advance
+    // coverageUpperMs with incomplete data, so this is a hard fail at definition time.
+    validateExplicitLimit(pinotQuery);
+
     // Step 2: source table existence and time-column checks
     String sourceTableName = validateSourceTable(pinotQuery, definedSql, clusterInfoAccessor);
 
@@ -131,6 +136,47 @@ public final class MaterializedViewAnalyzer {
     } catch (SqlCompilationException e) {
       throw new IllegalStateException("Invalid SQL syntax: " + e.getMessage(), e);
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  //  Step 1b — LIMIT validation (AST-based)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Requires the user's {@code definedSQL} to declare an explicit, bounded {@code LIMIT}.
+   *
+   * <p>We deliberately do not fall back to any silent default.  If the query actually produces
+   * more rows than the declared LIMIT the executor will detect the saturation (via
+   * {@code rows.size() >= LIMIT}) and fail the task, preventing incomplete data from being
+   * marked VALID and from advancing {@code coverageUpperMs}.
+   *
+   * @throws IllegalStateException if LIMIT is missing, non-positive, or exceeds
+   *     {@link MaterializedViewTask#MAX_MV_QUERY_LIMIT}
+   */
+  private static void validateExplicitLimit(PinotQuery pinotQuery) {
+    Preconditions.checkState(pinotQuery.isSetLimit(),
+        "MaterializedViewTask definedSQL must specify an explicit LIMIT clause. "
+            + "A missing LIMIT would allow silent result truncation which could cause the MV "
+            + "to be marked VALID with incomplete data.");
+    int limit = pinotQuery.getLimit();
+    Preconditions.checkState(limit > 0,
+        "MaterializedViewTask definedSQL LIMIT must be strictly positive, got: %s", limit);
+    Preconditions.checkState(limit <= MaterializedViewTask.MAX_MV_QUERY_LIMIT,
+        "MaterializedViewTask definedSQL LIMIT %s exceeds the maximum allowed LIMIT %s. "
+            + "Re-shape the query (e.g. narrower time bucket or stricter filters) so the "
+            + "per-window result set fits, or request a higher cap explicitly.",
+        limit, MaterializedViewTask.MAX_MV_QUERY_LIMIT);
+  }
+
+  /**
+   * Extracts the declared {@code LIMIT} value from {@code definedSQL}.  Assumes the SQL has
+   * already been accepted by {@link #analyze} (so LIMIT is guaranteed to be set).  Used by the
+   * task generator to propagate the effective limit to the executor without re-parsing there.
+   */
+  public static int extractDeclaredLimit(String definedSql) {
+    PinotQuery pinotQuery = validateSqlSyntax(definedSql);
+    validateExplicitLimit(pinotQuery);
+    return pinotQuery.getLimit();
   }
 
   // ---------------------------------------------------------------------------

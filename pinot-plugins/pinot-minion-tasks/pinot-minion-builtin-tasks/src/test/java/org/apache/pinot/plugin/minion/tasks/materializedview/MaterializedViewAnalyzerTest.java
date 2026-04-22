@@ -43,6 +43,8 @@ public class MaterializedViewAnalyzerTest {
   private static final String SOURCE_TABLE = "orders";
   private static final String SOURCE_TABLE_OFFLINE = "orders_OFFLINE";
   private static final String TIME_COLUMN = "DaysSinceEpoch";
+  /** Appended to every test SQL that is expected to reach validations beyond the LIMIT check. */
+  private static final String DEFAULT_LIMIT = " LIMIT 1000";
 
   private ClusterInfoAccessor _mockAccessor;
   private TableConfig _sourceTableConfig;
@@ -87,7 +89,7 @@ public class MaterializedViewAnalyzerTest {
     Map<String, String> taskConfigs = buildTaskConfigs(sql);
 
     MaterializedViewAnalyzer.AnalysisResult result =
-        MaterializedViewAnalyzer.analyze(sql, mvTableConfig, mvSchema, taskConfigs, _mockAccessor);
+        MaterializedViewAnalyzer.analyze(withLimit(sql), mvTableConfig, mvSchema, taskConfigs, _mockAccessor);
 
     assertNotNull(result);
     assertEquals(result.getSourceTableName(), SOURCE_TABLE);
@@ -116,7 +118,7 @@ public class MaterializedViewAnalyzerTest {
     Map<String, String> taskConfigs = buildTaskConfigs(sql);
 
     MaterializedViewAnalyzer.AnalysisResult result =
-        MaterializedViewAnalyzer.analyze(sql, mvTableConfig, mvSchema, taskConfigs, _mockAccessor);
+        MaterializedViewAnalyzer.analyze(withLimit(sql), mvTableConfig, mvSchema, taskConfigs, _mockAccessor);
 
     assertNotNull(result);
     assertEquals(result.getSelectFields().size(), 3);
@@ -138,7 +140,7 @@ public class MaterializedViewAnalyzerTest {
     Map<String, String> taskConfigs = buildTaskConfigs(sql);
 
     MaterializedViewAnalyzer.AnalysisResult result =
-        MaterializedViewAnalyzer.analyze(sql, mvTableConfig, mvSchema, taskConfigs, _mockAccessor);
+        MaterializedViewAnalyzer.analyze(withLimit(sql), mvTableConfig, mvSchema, taskConfigs, _mockAccessor);
 
     assertNotNull(result);
     assertEquals(result.getPartitionExprMaps().size(), 1);
@@ -202,6 +204,60 @@ public class MaterializedViewAnalyzerTest {
         .build();
 
     expectError("", mvSchema, "definedSQL must be specified");
+  }
+
+  // -----------------------------------------------------------------------
+  //  Step 1b: Explicit LIMIT requirement
+  // -----------------------------------------------------------------------
+
+  @Test
+  public void testMissingLimitRejected() {
+    String sql = "SELECT DaysSinceEpoch, city, count(*) AS cnt FROM orders GROUP BY DaysSinceEpoch, city";
+    Schema mvSchema = new Schema.SchemaBuilder()
+        .addSingleValueDimension("city", FieldSpec.DataType.STRING)
+        .addMetric("cnt", FieldSpec.DataType.LONG)
+        .addDateTime(TIME_COLUMN, FieldSpec.DataType.LONG, "1:DAYS:EPOCH", "1:DAYS")
+        .build();
+
+    Map<String, String> taskConfigs = buildTaskConfigs(sql);
+    expectErrorRaw(sql, mvSchema, taskConfigs, "must specify an explicit LIMIT");
+  }
+
+  @Test
+  public void testLimitAtMaxAllowed() {
+    String sql = "SELECT DaysSinceEpoch, city, count(*) AS cnt FROM orders "
+        + "GROUP BY DaysSinceEpoch, city "
+        + "LIMIT " + MaterializedViewTask.MAX_MV_QUERY_LIMIT;
+    Schema mvSchema = new Schema.SchemaBuilder()
+        .addSingleValueDimension("city", FieldSpec.DataType.STRING)
+        .addMetric("cnt", FieldSpec.DataType.LONG)
+        .addDateTime(TIME_COLUMN, FieldSpec.DataType.LONG, "1:DAYS:EPOCH", "1:DAYS")
+        .build();
+    TableConfig mvTableConfig = buildMvTableConfig();
+    Map<String, String> taskConfigs = buildTaskConfigs(sql);
+
+    // Must not throw — at-the-max is allowed.
+    MaterializedViewAnalyzer.AnalysisResult result =
+        MaterializedViewAnalyzer.analyze(sql, mvTableConfig, mvSchema, taskConfigs, _mockAccessor);
+    assertNotNull(result);
+  }
+
+  @Test
+  public void testExtractDeclaredLimit() {
+    String sql = "SELECT DaysSinceEpoch, city FROM orders LIMIT 2500";
+    assertEquals(MaterializedViewAnalyzer.extractDeclaredLimit(sql), 2500);
+  }
+
+  @Test
+  public void testExtractDeclaredLimitMissingThrows() {
+    String sql = "SELECT DaysSinceEpoch, city FROM orders";
+    try {
+      MaterializedViewAnalyzer.extractDeclaredLimit(sql);
+      fail("Expected IllegalStateException for SQL without LIMIT");
+    } catch (IllegalStateException e) {
+      assertTrue(e.getMessage().contains("must specify an explicit LIMIT"),
+          "Unexpected message: " + e.getMessage());
+    }
   }
 
   // -----------------------------------------------------------------------
@@ -334,7 +390,7 @@ public class MaterializedViewAnalyzerTest {
     Map<String, String> taskConfigs = buildTaskConfigs(sql);
 
     try {
-      MaterializedViewAnalyzer.analyze(sql, realtimeConfig, mvSchema, taskConfigs, _mockAccessor);
+      MaterializedViewAnalyzer.analyze(withLimit(sql), realtimeConfig, mvSchema, taskConfigs, _mockAccessor);
       fail("Expected IllegalStateException for non-OFFLINE table");
     } catch (IllegalStateException e) {
       assertTrue(e.getMessage().contains("only supports OFFLINE"), "Unexpected message: " + e.getMessage());
@@ -407,7 +463,7 @@ public class MaterializedViewAnalyzerTest {
     Map<String, String> taskConfigs = buildTaskConfigs(sql);
 
     MaterializedViewAnalyzer.AnalysisResult result =
-        MaterializedViewAnalyzer.analyze(sql, mvTableConfig, mvSchema, taskConfigs, _mockAccessor);
+        MaterializedViewAnalyzer.analyze(withLimit(sql), mvTableConfig, mvSchema, taskConfigs, _mockAccessor);
 
     assertNotNull(result);
     assertEquals(result.getSelectFields().size(), 6);
@@ -439,7 +495,7 @@ public class MaterializedViewAnalyzerTest {
     Map<String, String> taskConfigs = buildTaskConfigs(sql);
 
     MaterializedViewAnalyzer.AnalysisResult result =
-        MaterializedViewAnalyzer.analyze(sql, mvTableConfig, mvSchema, taskConfigs, _mockAccessor);
+        MaterializedViewAnalyzer.analyze(withLimit(sql), mvTableConfig, mvSchema, taskConfigs, _mockAccessor);
 
     assertNotNull(result);
     assertEquals(result.getSourceTableName(), "rt_orders");
@@ -469,6 +525,15 @@ public class MaterializedViewAnalyzerTest {
 
   private void expectError(String sql, Schema mvSchema, Map<String, String> taskConfigs,
       String expectedMessageFragment) {
+    expectErrorRaw(withLimit(sql), mvSchema, taskConfigs, expectedMessageFragment);
+  }
+
+  /**
+   * Same as {@link #expectError(String, Schema, Map, String)} but does not append a default
+   * LIMIT.  Used by tests that intentionally exercise the LIMIT-validation path.
+   */
+  private void expectErrorRaw(String sql, Schema mvSchema, Map<String, String> taskConfigs,
+      String expectedMessageFragment) {
     TableConfig mvTableConfig = buildMvTableConfig();
     try {
       MaterializedViewAnalyzer.analyze(sql, mvTableConfig, mvSchema, taskConfigs, _mockAccessor);
@@ -477,5 +542,13 @@ public class MaterializedViewAnalyzerTest {
       assertTrue(e.getMessage().contains(expectedMessageFragment),
           "Expected message containing '" + expectedMessageFragment + "', got: " + e.getMessage());
     }
+  }
+
+  /** Returns {@code sql} as-is if it already ends with a LIMIT clause, otherwise appends one. */
+  private static String withLimit(String sql) {
+    if (sql == null || sql.isEmpty()) {
+      return sql;
+    }
+    return sql.toUpperCase().contains(" LIMIT ") ? sql : sql + DEFAULT_LIMIT;
   }
 }

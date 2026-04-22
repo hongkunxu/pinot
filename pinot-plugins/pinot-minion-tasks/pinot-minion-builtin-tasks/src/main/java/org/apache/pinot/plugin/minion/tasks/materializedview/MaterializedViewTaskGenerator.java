@@ -308,7 +308,11 @@ public class MaterializedViewTaskGenerator extends BaseTaskGenerator {
     String windowStart = timeFormatSpec.fromMillisToFormat(windowStartMs);
     String windowEnd = timeFormatSpec.fromMillisToFormat(windowEndMs);
     String sqlWithTimeRange = appendTimeRange(definedSQL, sourceTimeColumn, windowStart, windowEnd);
-    sqlWithTimeRange = ensureLimit(sqlWithTimeRange, MaterializedViewTask.DEFAULT_MV_QUERY_LIMIT);
+
+    // The analyzer already rejected any definedSQL without an explicit LIMIT at create/update
+    // time, so this parse is guaranteed to return a positive, bounded limit.  We capture it into
+    // the task config so the executor can detect result-set saturation without re-parsing.
+    int effectiveLimit = MaterializedViewAnalyzer.extractDeclaredLimit(definedSQL);
 
     Map<String, String> configs = new HashMap<>();
     configs.put(MinionConstants.TABLE_NAME_KEY, mvTableName);
@@ -318,6 +322,7 @@ public class MaterializedViewTaskGenerator extends BaseTaskGenerator {
     configs.put(MaterializedViewTask.WINDOW_END_MS_KEY, String.valueOf(windowEndMs));
     configs.put(MaterializedViewTask.SOURCE_TABLE_NAME_KEY, sourceTableName);
     configs.put(MaterializedViewTask.TASK_MODE_KEY, taskMode);
+    configs.put(MaterializedViewTask.EFFECTIVE_LIMIT_KEY, String.valueOf(effectiveLimit));
     configs.put(MinionConstants.UPLOAD_URL_KEY,
         _clusterInfoAccessor.getVipUrl() + "/segments");
 
@@ -430,22 +435,6 @@ public class MaterializedViewTaskGenerator extends BaseTaskGenerator {
     // Move past the table name to find where to insert
     insertPos = findClauseEnd(upperSql, insertPos);
     return trimmed.substring(0, insertPos) + " WHERE " + timeFilter + trimmed.substring(insertPos);
-  }
-
-  /**
-   * Ensures the SQL contains an explicit LIMIT clause. If the user's SQL already has one, it is
-   * left unchanged; otherwise {@code defaultLimit} is appended. This prevents the broker from
-   * applying its own default limit (typically 10) which would silently truncate MV results.
-   */
-  static String ensureLimit(String sql, int defaultLimit) {
-    String trimmed = sql.trim();
-    if (trimmed.endsWith(";")) {
-      trimmed = trimmed.substring(0, trimmed.length() - 1).trim();
-    }
-    if (trimmed.toUpperCase().contains(" LIMIT ")) {
-      return trimmed;
-    }
-    return trimmed + " LIMIT " + defaultLimit;
   }
 
   private static boolean isNumeric(String value) {

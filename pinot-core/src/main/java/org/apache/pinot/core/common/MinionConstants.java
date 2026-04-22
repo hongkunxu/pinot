@@ -373,6 +373,14 @@ public class MinionConstants {
     public static final String SOURCE_TABLE_NAME_KEY = "sourceTableName";
     public static final String PARTITION_FINGERPRINTS_KEY = "partitionFingerprints";
 
+    /**
+     * Generator-populated copy of the user's declared {@code LIMIT} value from {@code definedSQL}.
+     * Passed through to the executor so it can detect result-set truncation (when the query
+     * actually returned {@code LIMIT}-many rows, the window is almost certainly incomplete and
+     * must not be marked VALID / advance {@code coverageUpperMs}).
+     */
+    public static final String EFFECTIVE_LIMIT_KEY = "effectiveLimit";
+
     public static final String TASK_MODE_KEY = "taskMode";
     public static final String TASK_MODE_APPEND = "APPEND";
     public static final String TASK_MODE_OVERWRITE = "OVERWRITE";
@@ -381,10 +389,15 @@ public class MinionConstants {
     public static final int DEFAULT_MAX_NUM_RECORDS_PER_SEGMENT = 4000;
 
     /**
-     * Default LIMIT applied to the MV query when the user's {@code definedSQL} does not contain
-     * an explicit LIMIT clause.  Without this, the broker would apply its own default (typically 10),
-     * which silently truncates MV results.
+     * Upper bound on the LIMIT that a user may declare in {@code definedSQL}.  The MV definition
+     * MUST contain an explicit {@code LIMIT} clause (validated by {@code MaterializedViewAnalyzer}),
+     * and that LIMIT must be strictly positive and not exceed this cap.
+     *
+     * <p>Rationale: there is no safe "silent default" — if the materialized query truly returns
+     * more rows than the LIMIT, the resulting MV is incomplete but would otherwise be marked VALID
+     * and advance {@code coverageUpperMs}, letting brokers rewrite subsequent queries against
+     * truncated data and return wrong results.  Users must opt into a concrete, bounded LIMIT.
      */
-    public static final int DEFAULT_MV_QUERY_LIMIT = 1_000_000;
+    public static final int MAX_MV_QUERY_LIMIT = Integer.MAX_VALUE;
   }
 }

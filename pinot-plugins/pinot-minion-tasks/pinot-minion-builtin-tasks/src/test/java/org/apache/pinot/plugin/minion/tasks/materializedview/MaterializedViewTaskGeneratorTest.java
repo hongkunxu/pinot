@@ -26,48 +26,6 @@ import static org.testng.Assert.assertEquals;
 public class MaterializedViewTaskGeneratorTest {
 
   @Test
-  public void testEnsureLimitAddsDefaultWhenMissing() {
-    String sql = "SELECT col1, SUM(col2) FROM myTable GROUP BY col1";
-    String result = MaterializedViewTaskGenerator.ensureLimit(sql, 1_000_000);
-    assertEquals(result, "SELECT col1, SUM(col2) FROM myTable GROUP BY col1 LIMIT 1000000");
-  }
-
-  @Test
-  public void testEnsureLimitPreservesExistingLimit() {
-    String sql = "SELECT col1, SUM(col2) FROM myTable GROUP BY col1 LIMIT 500";
-    String result = MaterializedViewTaskGenerator.ensureLimit(sql, 1_000_000);
-    assertEquals(result, "SELECT col1, SUM(col2) FROM myTable GROUP BY col1 LIMIT 500");
-  }
-
-  @Test
-  public void testEnsureLimitPreservesExistingLimitCaseInsensitive() {
-    String sql = "SELECT col1 FROM myTable limit 200";
-    String result = MaterializedViewTaskGenerator.ensureLimit(sql, 1_000_000);
-    assertEquals(result, "SELECT col1 FROM myTable limit 200");
-  }
-
-  @Test
-  public void testEnsureLimitStripsTrailingSemicolon() {
-    String sql = "SELECT col1 FROM myTable;";
-    String result = MaterializedViewTaskGenerator.ensureLimit(sql, 1_000_000);
-    assertEquals(result, "SELECT col1 FROM myTable LIMIT 1000000");
-  }
-
-  @Test
-  public void testEnsureLimitWithWhereClause() {
-    String sql = "SELECT col1 FROM myTable WHERE col2 > 10 GROUP BY col1";
-    String result = MaterializedViewTaskGenerator.ensureLimit(sql, 500_000);
-    assertEquals(result, "SELECT col1 FROM myTable WHERE col2 > 10 GROUP BY col1 LIMIT 500000");
-  }
-
-  @Test
-  public void testEnsureLimitWithOrderByAndExistingLimit() {
-    String sql = "SELECT col1 FROM myTable ORDER BY col1 LIMIT 100";
-    String result = MaterializedViewTaskGenerator.ensureLimit(sql, 1_000_000);
-    assertEquals(result, "SELECT col1 FROM myTable ORDER BY col1 LIMIT 100");
-  }
-
-  @Test
   public void testAppendTimeRangeNoWhereClause() {
     String sql = "SELECT col1, SUM(col2) FROM myTable GROUP BY col1";
     String result = MaterializedViewTaskGenerator.appendTimeRange(sql, "ts", "100", "200");
