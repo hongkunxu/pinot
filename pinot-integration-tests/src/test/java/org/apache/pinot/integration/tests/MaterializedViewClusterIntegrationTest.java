@@ -445,6 +445,140 @@ public class MaterializedViewClusterIntegrationTest extends BaseClusterIntegrati
   }
 
   // -----------------------------------------------------------------------
+  //  Correctness: non-atomic endSegmentReplace <-> coverageUpperMs window
+  // -----------------------------------------------------------------------
+
+  /**
+   * Reproduces the non-atomic publish window between the minion executor's
+   * {@code endSegmentReplace} (new MV segments become queryable on servers) and
+   * {@code postProcess} (ZK {@code coverageUpperMs} advances). During that window
+   * the broker observes a stale {@code coverageUpperMs = U_old} while the MV
+   * table physically contains already-materialized rows in {@code [U_old, U_new)}.
+   *
+   * <p>Before the {@code mvTime < coverageUpperMs} filter was attached on the MV
+   * branch:
+   * <ul>
+   *   <li>MV branch: reads rows {@code [0, U_new)} (no upper bound) —
+   *       includes the new, not-yet-published range.</li>
+   *   <li>Base branch: reads rows {@code [U_old, +inf)} — also includes the
+   *       new range.</li>
+   * </ul>
+   * The overlap {@code [U_old, U_new)} is double-counted in the merged result.
+   *
+   * <p>This test simulates that exact window by uploading MV segments covering
+   * a range beyond the current {@code coverageUpperMs} without advancing it,
+   * and asserts that the MV rewrite still produces the same sums as a baseline
+   * query taken before the overlap segments existed — i.e., the MV branch
+   * correctly excludes the not-yet-published range.
+   *
+   * <p>Depends on {@link #testIncrementalAppend()} which leaves the split MV
+   * covering days 16071–16095 and {@code coverageUpperMs = 16096 * day}.
+   */
+  @Test(dependsOnMethods = "testIncrementalAppend")
+  public void testSplitCorrectnessDuringNonAtomicPublishWindow()
+      throws Exception {
+    // NOTE: explicit ORDER BY on grouping keys + large LIMIT is required here.
+    // Without them we inherit the default broker LIMIT (10) with no ORDER BY, so the
+    // "top 10" groups are picked by server-side iteration order. Adding new MV segments
+    // perturbs segment iteration / group-merge order even when the mvTime < coverageUpperMs
+    // filter correctly excludes every row in those segments, which would make this test
+    // flaky (keySet mismatch) for reasons unrelated to the CRITICAL #1 invariant we are
+    // actually verifying. Sorting by the grouping keys and asking for more rows than the
+    // real cardinality makes the result deterministic regardless of segment layout.
+    String query = "SET useMaterializedView=true; "
+        + "SELECT Carrier, Origin, SUM(ArrDelayMinutes) AS sum_ArrDelayMinutes "
+        + "FROM " + SOURCE_TABLE_NAME + " "
+        + "GROUP BY Carrier, Origin "
+        + "ORDER BY Carrier, Origin "
+        + "LIMIT 10000";
+
+    // Step 1: baseline — split query before the simulated overlap.
+    // MV has days 16071..16095, coverageUpperMs = 16096 * day.
+    JsonNode baseline = postQuery(query);
+    assertNoExceptions(baseline);
+    assertEquals(getHitMv(baseline), MV_SPLIT_TABLE_OFFLINE,
+        "Precondition: split MV must be hit to exercise the split path");
+    java.util.Map<String, Double> baselineSums = collectSumByCarrierOrigin(baseline);
+    assertFalse(baselineSums.isEmpty(), "Baseline must contain grouped rows");
+
+    // Step 2: simulate endSegmentReplace without postProcess — upload MV segments
+    // for days 16096..16100 (ALREADY physically queryable on servers), but leave
+    // coverageUpperMs at 16096 in ZK (postProcess has not yet run).
+    Schema mvSchema = new Schema.SchemaBuilder()
+        .setSchemaName(MV_SPLIT_TABLE_NAME)
+        .addDateTime(TIME_COLUMN, FieldSpec.DataType.INT, "1:DAYS:EPOCH", "1:DAYS")
+        .addSingleValueDimension("Carrier", FieldSpec.DataType.STRING)
+        .addSingleValueDimension("Origin", FieldSpec.DataType.STRING)
+        .addMetric("sum_ArrDelayMinutes", FieldSpec.DataType.DOUBLE)
+        .build();
+    TableConfig mvTableConfig = new TableConfigBuilder(TableType.OFFLINE)
+        .setTableName(MV_SPLIT_TABLE_NAME)
+        .setTimeColumnName(TIME_COLUMN)
+        .setNumReplicas(1)
+        .build();
+
+    String[] origins = {"SFO", "LAX", "JFK", "ORD", "ATL"};
+    List<GenericRow> rows = new ArrayList<>();
+    for (int day = 16096; day <= 16100; day++) {
+      for (String carrier : CARRIERS) {
+        for (String origin : origins) {
+          GenericRow row = new GenericRow();
+          row.putValue(TIME_COLUMN, day);
+          row.putValue("Carrier", carrier);
+          row.putValue("Origin", origin);
+          // Use large, distinctive sums so any leak into the merged result is
+          // trivially detectable — not a rounding-level perturbation.
+          row.putValue("sum_ArrDelayMinutes", 1_000_000.0);
+          rows.add(row);
+        }
+      }
+    }
+    long beforeCount = getCurrentCountStarResult(MV_SPLIT_TABLE_NAME);
+    buildAndUploadSegment(mvTableConfig, mvSchema, rows, MV_SPLIT_TABLE_NAME, "mvSplitOverlap");
+    TestUtils.waitForCondition(
+        () -> getCurrentCountStarResult(MV_SPLIT_TABLE_NAME) > beforeCount,
+        100L, 60_000L, "Overlap MV segments not visible on servers", Duration.ofSeconds(6));
+
+    // Intentionally NO MvRuntimeMetadataUtils.persist here — this is the whole
+    // point of the test: segments are live, ZK coverage is stale.
+
+    // Step 3: rerun the split query. With the mvTime < coverageUpperMs filter
+    // on the MV branch, the newly uploaded "leak" segments are excluded and
+    // sums must equal the baseline. Without the fix, each group's sum would be
+    // inflated by 1_000_000 * 5 days = 5_000_000 relative to the baseline.
+    JsonNode after = postQuery(query);
+    assertNoExceptions(after);
+    assertEquals(getHitMv(after), MV_SPLIT_TABLE_OFFLINE,
+        "Split MV must still be hit after overlap segments are published");
+
+    java.util.Map<String, Double> afterSums = collectSumByCarrierOrigin(after);
+    assertEquals(afterSums.keySet(), baselineSums.keySet(),
+        "Group keys must not change when new MV segments are published beyond coverage");
+    for (java.util.Map.Entry<String, Double> e : baselineSums.entrySet()) {
+      double expected = e.getValue();
+      double actual = afterSums.get(e.getKey());
+      // Allow tiny floating-point drift; any leak is at least 1_000_000 per affected group.
+      assertEquals(actual, expected, 1e-6,
+          "MV branch must exclude segments beyond coverageUpperMs (non-atomic publish window). "
+              + "Group=" + e.getKey() + ", baseline=" + expected + ", after=" + actual
+              + ". A large delta here means the MV branch read rows in [coverageUpperMs, newMax), "
+              + "double-counting with the base branch.");
+    }
+  }
+
+  /** Extracts (Carrier|Origin -> sum_ArrDelayMinutes) from a grouped response. */
+  private static java.util.Map<String, Double> collectSumByCarrierOrigin(JsonNode response) {
+    java.util.Map<String, Double> result = new HashMap<>();
+    JsonNode rowsNode = response.get("resultTable").get("rows");
+    for (int i = 0; i < rowsNode.size(); i++) {
+      JsonNode row = rowsNode.get(i);
+      String key = row.get(0).asText() + "|" + row.get(1).asText();
+      result.put(key, row.get(2).asDouble());
+    }
+    return result;
+  }
+
+  // -----------------------------------------------------------------------
   //  Phase 2, Test 5: Freshness gating — STALE MV is skipped
   // -----------------------------------------------------------------------
 
@@ -778,7 +912,10 @@ public class MaterializedViewClusterIntegrationTest extends BaseClusterIntegrati
         + "SUM(ArrDelayMinutes) AS sum_ArrDelayMinutes "
         + "FROM " + SOURCE_TABLE_NAME + " "
         + "GROUP BY " + TIME_COLUMN + ", Carrier, Origin";
-    MvSplitSpec splitSpec = new MvSplitSpec(TIME_COLUMN, "1:DAYS:EPOCH", 86_400_000L);
+    MvSplitSpec splitSpec = new MvSplitSpec(
+        TIME_COLUMN, "1:DAYS:EPOCH",
+        TIME_COLUMN, "1:DAYS:EPOCH",
+        86_400_000L);
     MvDefinitionMetadata definition = new MvDefinitionMetadata(
         MV_SPLIT_TABLE_OFFLINE,
         Collections.singletonList(SOURCE_TABLE_NAME),
@@ -823,7 +960,10 @@ public class MaterializedViewClusterIntegrationTest extends BaseClusterIntegrati
         + "SUM(ArrDelayMinutes) AS sum_ArrDelayMinutes "
         + "FROM " + SOURCE_TABLE_NAME + " "
         + "GROUP BY " + TIME_COLUMN + ", Carrier, Origin";
-    MvSplitSpec splitSpec = new MvSplitSpec(TIME_COLUMN, "1:DAYS:EPOCH", 86_400_000L);
+    MvSplitSpec splitSpec = new MvSplitSpec(
+        TIME_COLUMN, "1:DAYS:EPOCH",
+        TIME_COLUMN, "1:DAYS:EPOCH",
+        86_400_000L);
     MvDefinitionMetadata definition = new MvDefinitionMetadata(
         MV_COLD_TABLE_OFFLINE,
         Collections.singletonList(SOURCE_TABLE_NAME),

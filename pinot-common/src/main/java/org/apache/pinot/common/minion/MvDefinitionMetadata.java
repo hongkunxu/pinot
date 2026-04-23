@@ -47,6 +47,8 @@ public class MvDefinitionMetadata {
   private static final String PARTITION_EXPR_MAPS_KEY = "partitionExprMaps";
   private static final String SPLIT_SOURCE_TIME_COLUMN_KEY = "splitSourceTimeColumn";
   private static final String SPLIT_SOURCE_TIME_FORMAT_KEY = "splitSourceTimeFormat";
+  private static final String SPLIT_MV_TIME_COLUMN_KEY = "splitMvTimeColumn";
+  private static final String SPLIT_MV_TIME_FORMAT_KEY = "splitMvTimeFormat";
   private static final String SPLIT_BUCKET_MS_KEY = "splitBucketMs";
 
   private static final TypeReference<List<String>> STRING_LIST_TYPE =
@@ -115,6 +117,8 @@ public class MvDefinitionMetadata {
     if (_splitSpec != null) {
       znRecord.setSimpleField(SPLIT_SOURCE_TIME_COLUMN_KEY, _splitSpec.getSourceTimeColumn());
       znRecord.setSimpleField(SPLIT_SOURCE_TIME_FORMAT_KEY, _splitSpec.getSourceTimeFormat());
+      znRecord.setSimpleField(SPLIT_MV_TIME_COLUMN_KEY, _splitSpec.getMvTimeColumn());
+      znRecord.setSimpleField(SPLIT_MV_TIME_FORMAT_KEY, _splitSpec.getMvTimeFormat());
       znRecord.setLongField(SPLIT_BUCKET_MS_KEY, _splitSpec.getBucketMs());
     }
 
@@ -140,8 +144,10 @@ public class MvDefinitionMetadata {
       String sourceTimeColumn = znRecord.getSimpleField(SPLIT_SOURCE_TIME_COLUMN_KEY);
       if (sourceTimeColumn != null) {
         String sourceTimeFormat = znRecord.getSimpleField(SPLIT_SOURCE_TIME_FORMAT_KEY);
+        String mvTimeColumn = znRecord.getSimpleField(SPLIT_MV_TIME_COLUMN_KEY);
+        String mvTimeFormat = znRecord.getSimpleField(SPLIT_MV_TIME_FORMAT_KEY);
         long bucketMs = znRecord.getLongField(SPLIT_BUCKET_MS_KEY, 0L);
-        splitSpec = new MvSplitSpec(sourceTimeColumn, sourceTimeFormat, bucketMs);
+        splitSpec = new MvSplitSpec(sourceTimeColumn, sourceTimeFormat, mvTimeColumn, mvTimeFormat, bucketMs);
       }
 
       return new MvDefinitionMetadata(mvTableNameWithType, baseTables, definedSql,
@@ -152,19 +158,37 @@ public class MvDefinitionMetadata {
   }
 
   /**
-   * Specifies the time-column semantics needed for MV split queries: which source
-   * column to filter on, its format, and the partition bucket size.
+   * Specifies the time-column semantics needed for MV split queries on both sides of the
+   * split boundary {@code coverageUpperMs}:
+   *
+   * <ul>
+   *   <li>Source (base) side: filter {@code sourceTimeColumn >= coverageUpperMs},
+   *       converted via {@code sourceTimeFormat}. Covers {@code [coverageUpperMs, +inf)}.</li>
+   *   <li>MV side: filter {@code mvTimeColumn < coverageUpperMs}, converted via
+   *       {@code mvTimeFormat}. Covers {@code [-inf, coverageUpperMs)}.</li>
+   * </ul>
+   *
+   * <p>The MV-side fields are required because MV definitions commonly rename the time
+   * column (e.g. via {@code dateTimeConvert(ts, ...)}) and may use a coarser granularity
+   * than the source (e.g. base {@code EPOCH|MILLIS} vs MV {@code EPOCH|DAYS}). Without
+   * persisting the MV-side column and format, the broker cannot reconstruct the
+   * complementary filter on the MV branch.
    *
    * <p>Thread-safety: instances are immutable.
    */
   public static class MvSplitSpec {
     private final String _sourceTimeColumn;
     private final String _sourceTimeFormat;
+    private final String _mvTimeColumn;
+    private final String _mvTimeFormat;
     private final long _bucketMs;
 
-    public MvSplitSpec(String sourceTimeColumn, String sourceTimeFormat, long bucketMs) {
+    public MvSplitSpec(String sourceTimeColumn, String sourceTimeFormat, String mvTimeColumn, String mvTimeFormat,
+        long bucketMs) {
       _sourceTimeColumn = sourceTimeColumn;
       _sourceTimeFormat = sourceTimeFormat;
+      _mvTimeColumn = mvTimeColumn;
+      _mvTimeFormat = mvTimeFormat;
       _bucketMs = bucketMs;
     }
 
@@ -174,6 +198,14 @@ public class MvDefinitionMetadata {
 
     public String getSourceTimeFormat() {
       return _sourceTimeFormat;
+    }
+
+    public String getMvTimeColumn() {
+      return _mvTimeColumn;
+    }
+
+    public String getMvTimeFormat() {
+      return _mvTimeFormat;
     }
 
     public long getBucketMs() {

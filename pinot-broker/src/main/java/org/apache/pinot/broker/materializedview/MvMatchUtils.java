@@ -188,6 +188,22 @@ public final class MvMatchUtils {
    *   <li>Otherwise &rarr; returns null (no match)</li>
    * </ul>
    *
+   * <p><b>TODO(mv): OR / IN subsumption is currently correctness-safe but conservative.</b>
+   * OR and IN nodes are treated as opaque atomic conjuncts and compared via
+   * {@code Objects.equals} (structure + operand-order sensitive), not by semantic
+   * set containment. The following patterns are rejected today even though the MV
+   * technically covers the user's rows; users fall back to the base table:
+   * <ul>
+   *   <li>OR-operand reorder &mdash; MV {@code a OR b} vs user {@code b OR a}</li>
+   *   <li>IN-operand reorder &mdash; MV {@code x IN (1,2,3)} vs user {@code x IN (3,1,2)}</li>
+   *   <li>IN / OR superset &mdash; MV {@code x IN (1,2,3)} (or {@code a OR b OR c})
+   *       covers user {@code x IN (1,2)}, {@code x = 1}, or {@code a OR b}</li>
+   *   <li>IN and chained-OR equivalence &mdash; {@code x IN (1,2)} vs {@code x = 1 OR x = 2}</li>
+   * </ul>
+   * Before relaxing any of the above, add regression tests covering the opposite
+   * direction (MV narrower than user, e.g. MV {@code x IN (1,2)} vs user
+   * {@code x IN (1,2,3)}) so the correctness guardrail is not eroded.
+   *
    * @param userFilter the user query's filter expression (may be null)
    * @param mvFilter   the MV query's filter expression (may be null)
    * @return the residual filter expression, or {@code null} if the user filter

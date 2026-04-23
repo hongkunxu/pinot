@@ -114,6 +114,16 @@ public abstract class AbstractSubsumptionStrategy implements MvMatchStrategy {
     Expression mvFilter = mvQuery.getFilterExpression();
     boolean filtersEqual = Objects.equals(userFilter, mvFilter);
 
+    // AND is commutative and associative. Two filters with the same conjunct set are equivalent
+    // even if the underlying List<Expression> order differs (e.g. user wrote "b AND a" but the MV
+    // was defined with "a AND b"). Promote to filtersEqual so we don't fall into the residual
+    // extraction branch and misreport "not a superset" when the residual set is in fact empty.
+    if (!filtersEqual && userFilter != null && mvFilter != null) {
+      if (MvMatchUtils.flattenAnd(userFilter).equals(MvMatchUtils.flattenAnd(mvFilter))) {
+        filtersEqual = true;
+      }
+    }
+
     Expression residualFilter = null;
     if (!filtersEqual) {
       residualFilter = MvMatchUtils.tryExtractResidualFilter(userFilter, mvFilter);

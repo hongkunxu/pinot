@@ -457,6 +457,26 @@ public class AggregationSubsumptionStrategyTest {
   }
 
   @Test
+  public void testMatchWhenUserAndConjunctsReordered() {
+    // MV defined with two AND conjuncts; user writes the same conjuncts in the opposite order.
+    // AND is commutative, so this must match with the no-residual cost and a null rewritten filter.
+    String definedSql =
+        "SELECT city, SUM(revenue) AS sum_rev FROM orders "
+            + "WHERE region = 'US' AND status = 'active' GROUP BY city";
+    MvMetadataCache.MvCacheEntry entry = createEntry("mv_orders_OFFLINE", "orders", definedSql);
+
+    PinotQuery userQuery = CalciteSqlParser.compileToPinotQuery(
+        "SELECT city, SUM(revenue) FROM orders "
+            + "WHERE status = 'active' AND region = 'US' GROUP BY city");
+    MvRewritePlan result = _strategy.match(userQuery, entry);
+
+    assertNotNull(result, "AND is commutative: reordered conjuncts must still match");
+    assertEquals(result.getCost(), 6.0, "Set-equal filters -> no-residual cost");
+    assertNull(result.getMvQuery().getFilterExpression(),
+        "Set-equal filters should leave the rewritten MV query with no residual filter");
+  }
+
+  @Test
   public void testNoFilterWhenFiltersEqualAndNoHaving() {
     String definedSql =
         "SELECT city, SUM(revenue) AS sum_rev FROM orders WHERE region = 'US' GROUP BY city";

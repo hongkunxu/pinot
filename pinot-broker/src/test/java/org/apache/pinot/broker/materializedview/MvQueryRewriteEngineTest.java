@@ -22,9 +22,11 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
+import javax.annotation.Nullable;
 import org.apache.pinot.broker.materializedview.strategy.ExactSubsumptionStrategy;
 import org.apache.pinot.broker.materializedview.strategy.MvMatchStrategy;
 import org.apache.pinot.common.minion.MvDefinitionMetadata;
+import org.apache.pinot.common.minion.MvDefinitionMetadata.MvSplitSpec;
 import org.apache.pinot.common.minion.MvFreshness;
 import org.apache.pinot.common.request.PinotQuery;
 import org.apache.pinot.sql.parsers.CalciteSqlParser;
@@ -42,14 +44,24 @@ public class MvQueryRewriteEngineTest {
 
   private MvMetadataCache.MvCacheEntry createEntry(String mvTableName, String baseTable, String definedSql,
       MvFreshness freshness) {
+    return createEntry(mvTableName, baseTable, definedSql, freshness, null, 0L);
+  }
+
+  /**
+   * Variant that attaches a {@link MvSplitSpec} and a non-zero {@code coverageUpperMs},
+   * so the rewrite engine goes down the SPLIT_REWRITE branch (exercising the guard
+   * on MV-side time column/format).
+   */
+  private MvMetadataCache.MvCacheEntry createEntry(String mvTableName, String baseTable, String definedSql,
+      MvFreshness freshness, @Nullable MvSplitSpec splitSpec, long coverageUpperMs) {
     MvDefinitionMetadata definition = new MvDefinitionMetadata(
         mvTableName,
         Collections.singletonList(baseTable),
         definedSql,
         new HashMap<>(),
-        null);
+        splitSpec);
     PinotQuery compiledQuery = CalciteSqlParser.compileToPinotQuery(definedSql);
-    return new MvMetadataCache.MvCacheEntry(definition, compiledQuery, 0L, freshness);
+    return new MvMetadataCache.MvCacheEntry(definition, compiledQuery, coverageUpperMs, freshness);
   }
 
   @Test
@@ -229,5 +241,67 @@ public class MvQueryRewriteEngineTest {
     assertTrue(result.isHit());
     assertEquals(result.getHitMvName(), "mv_fresh_OFFLINE");
     assertEquals(result.getCandidateNames(), List.of("mv_stale_OFFLINE", "mv_fresh_OFFLINE"));
+  }
+
+  // ---------------------------------------------------------------------------
+  // SPLIT_REWRITE guard: malformed MvSplitSpec must not produce a split plan.
+  //
+  // Without the MV-side time column + format, the broker cannot attach the
+  // complementary `mvTime < coverageUpperMs` filter on the MV branch. Running
+  // a split query in that state risks double-counting rows materialized during
+  // the endSegmentReplace -> coverageUpperMs publish window. The engine must
+  // reject such candidates entirely (not silently fall back to an unguarded
+  // split).
+  // ---------------------------------------------------------------------------
+
+  @Test
+  public void testSkipSplitWhenMvTimeColumnMissing() {
+    String definedSql = "SELECT city, SUM(revenue) AS sum_revenue FROM orders GROUP BY city";
+    String userSql = "SELECT city, SUM(revenue) FROM orders GROUP BY city";
+
+    MvSplitSpec malformed = new MvSplitSpec(
+        "ts", "1:MILLISECONDS:EPOCH",
+        null, "1:DAYS:EPOCH",
+        86_400_000L);
+    MvMetadataCache.MvCacheEntry entry = createEntry(
+        "mv_split_OFFLINE", "orders", definedSql, MvFreshness.FRESH, malformed, 86_400_000L);
+
+    MvMetadataCache cache = mock(MvMetadataCache.class);
+    when(cache.getMvEntriesForBaseTable("orders")).thenReturn(List.of(entry));
+
+    MvQueryRewriteEngine engine = new MvQueryRewriteEngine(cache, List.of(new ExactSubsumptionStrategy()));
+    PinotQuery userQuery = CalciteSqlParser.compileToPinotQuery(userSql);
+
+    MvRewriteResult result = engine.tryRewrite(userQuery, "orders");
+    assertNotNull(result);
+    assertFalse(result.isHit(),
+        "SPLIT_REWRITE must be skipped when mvTimeColumn is null; otherwise the MV branch "
+            + "would run without an upper-bound filter and double-count with the base branch.");
+    assertEquals(result.getCandidateNames(), List.of("mv_split_OFFLINE"));
+  }
+
+  @Test
+  public void testSkipSplitWhenMvTimeFormatEmpty() {
+    String definedSql = "SELECT city, SUM(revenue) AS sum_revenue FROM orders GROUP BY city";
+    String userSql = "SELECT city, SUM(revenue) FROM orders GROUP BY city";
+
+    MvSplitSpec malformed = new MvSplitSpec(
+        "ts", "1:MILLISECONDS:EPOCH",
+        "mvDay", "",
+        86_400_000L);
+    MvMetadataCache.MvCacheEntry entry = createEntry(
+        "mv_split_OFFLINE", "orders", definedSql, MvFreshness.FRESH, malformed, 86_400_000L);
+
+    MvMetadataCache cache = mock(MvMetadataCache.class);
+    when(cache.getMvEntriesForBaseTable("orders")).thenReturn(List.of(entry));
+
+    MvQueryRewriteEngine engine = new MvQueryRewriteEngine(cache, List.of(new ExactSubsumptionStrategy()));
+    PinotQuery userQuery = CalciteSqlParser.compileToPinotQuery(userSql);
+
+    MvRewriteResult result = engine.tryRewrite(userQuery, "orders");
+    assertNotNull(result);
+    assertFalse(result.isHit(),
+        "SPLIT_REWRITE must be skipped when mvTimeFormat is empty; format is required to convert "
+            + "coverageUpperMs (epoch millis) into the MV column's native representation.");
   }
 }

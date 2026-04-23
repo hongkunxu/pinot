@@ -56,6 +56,8 @@ import org.apache.pinot.sql.parsers.SqlCompilationException;
  *   <li>MV schema column completeness against the SELECT output fields</li>
  *   <li>Aggregation function recognition</li>
  *   <li>Task config parameter validity (bucket period, buffer period, etc.)</li>
+ *   <li>MV time column alignment: {@code segmentsConfig.timeColumnName} exists in the MV
+ *       schema as a {@link DateTimeFieldSpec} and is produced by a SELECT expression</li>
  * </ol>
  *
  * <p>Thread-safety: all methods are stateless and static.
@@ -103,6 +105,12 @@ public final class MaterializedViewAnalyzer {
 
     // Step 5: extract and validate time column transformation mappings
     Map<String, String> partitionExprMaps = extractPartitionExprMaps(pinotQuery, mvSchema);
+
+    // Step 6: MV time column (segmentsConfig.timeColumnName) must be wired to a SELECT-produced
+    // dateTime column. Without this guard, a mismatch (e.g. timeColumnName=ts but SELECT only
+    // produces date_trunc('DAY', ts) AS day) would only surface at task scheduling time via the
+    // runtime Preconditions in MaterializedViewTaskGenerator#resolveMvTimeColumn / resolveMvTimeFormat.
+    validateMvTimeColumnAlignment(mvTableConfig, mvSchema, partitionExprMaps);
 
     return new AnalysisResult(sourceTableName, selectFields, partitionExprMaps);
   }
@@ -469,6 +477,65 @@ public final class MaterializedViewAnalyzer {
   public static Map<String, String> extractPartitionExprMaps(String definedSql, Schema mvSchema) {
     PinotQuery pinotQuery = validateSqlSyntax(definedSql);
     return extractPartitionExprMaps(pinotQuery, mvSchema);
+  }
+
+  // ---------------------------------------------------------------------------
+  //  Step 6 — MV time column alignment
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Verifies at create/update time that the MV's {@code segmentsConfig.timeColumnName}
+   * is actually produced by the {@code definedSql} and is a valid dateTime column in the
+   * MV schema.
+   *
+   * <p>Without this guard, a misconfiguration (e.g. {@code timeColumnName} inherited from
+   * the base table as {@code ts}, while SELECT only produces
+   * {@code date_trunc('DAY', ts) AS day}) would only surface when the minion schedules a
+   * task — the runtime {@code Preconditions} in
+   * {@link MaterializedViewTaskGenerator}{@code #resolveMvTimeColumn} /
+   * {@code #resolveMvTimeFormat} would then throw, failing the task instead of the
+   * table configuration.
+   *
+   * <p>Enforced invariants:
+   * <ol>
+   *   <li>{@code timeColumnName} is set</li>
+   *   <li>It exists in the MV schema</li>
+   *   <li>It is registered as a {@link DateTimeFieldSpec} (not a dimension / metric)</li>
+   *   <li>It is produced by some SELECT expression (present in {@code partitionExprMaps}'s
+   *       values) — i.e. physically present in the MV</li>
+   * </ol>
+   *
+   * <p>TODO(mv): Invariant (4) establishes the column exists; a stricter future check would
+   * deduce the output format of the producing SELECT expression (e.g.
+   * {@code date_trunc('DAY', ts)} -&gt; {@code 1:MILLISECONDS:EPOCH}) and cross-verify it
+   * against {@code fieldSpec.getFormat()} so a format mismatch is also caught at create
+   * time. That requires a function-to-format registry and is deferred.
+   */
+  private static void validateMvTimeColumnAlignment(TableConfig mvTableConfig, Schema mvSchema,
+      Map<String, String> partitionExprMaps) {
+    String mvTimeColumn = mvTableConfig.getValidationConfig().getTimeColumnName();
+
+    Preconditions.checkState(mvTimeColumn != null && !mvTimeColumn.isEmpty(),
+        "MV table segmentsConfig.timeColumnName must be set (required for incremental refresh "
+            + "and split-mode query rewrite).");
+
+    Preconditions.checkState(mvSchema.getColumnNames().contains(mvTimeColumn),
+        "MV time column '%s' does not exist in MV schema. Schema columns: %s",
+        mvTimeColumn, mvSchema.getColumnNames());
+
+    DateTimeFieldSpec fieldSpec = mvSchema.getSpecForTimeColumn(mvTimeColumn);
+    Preconditions.checkState(fieldSpec != null,
+        "MV time column '%s' is declared in segmentsConfig but is not a dateTime field in the MV "
+            + "schema. Register it under dateTimeFieldSpecs with an explicit format.", mvTimeColumn);
+
+    Preconditions.checkState(partitionExprMaps.containsValue(mvTimeColumn),
+        "MV time column '%s' is not produced by any SELECT expression in definedSql. "
+            + "The MV will not contain this column physically. "
+            + "Either change segmentsConfig.timeColumnName to one of the time columns the "
+            + "definedSql produces (candidates: %s), or add a SELECT alias that produces '%s'.",
+        mvTimeColumn,
+        partitionExprMaps.values().isEmpty() ? "<none>" : partitionExprMaps.values(),
+        mvTimeColumn);
   }
 
   // ---------------------------------------------------------------------------

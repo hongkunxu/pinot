@@ -195,6 +195,24 @@ public class MvQueryRewriteEngine {
         return null;
       }
 
+      // Split mode needs both sides of the boundary filter:
+      //   base branch: sourceTime >= coverageUpperMs
+      //   MV branch:   mvTime    <  coverageUpperMs
+      // If the MV-side fields are missing (malformed metadata, partial upgrade,
+      // cold-start race), we cannot reconstruct the MV-side filter and would risk
+      // double-counting during the endSegmentReplace -> coverageUpperMs publish
+      // window. Skip this candidate entirely rather than falling back to an
+      // unguarded split.
+      if (splitSpec.getMvTimeColumn() == null || splitSpec.getMvTimeColumn().isEmpty()
+          || splitSpec.getMvTimeFormat() == null || splitSpec.getMvTimeFormat().isEmpty()) {
+        LOGGER.warn("MV skip [{}]: split spec missing MV-side time column/format "
+                + "(mvTimeColumn={}, mvTimeFormat={}); cannot attach mvTime < boundary filter. "
+                + "Skipping this MV to avoid double-counting.",
+            candidate.getMvTableNameWithType(),
+            splitSpec.getMvTimeColumn(), splitSpec.getMvTimeFormat());
+        return null;
+      }
+
       // EXACT match replaces aggregation functions (e.g. SUM(col)) with plain
       // MV column references (e.g. col_sum), producing physical column types
       // on the MV side that are incompatible with the base table's aggregation

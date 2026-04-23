@@ -136,6 +136,38 @@ public class ScanSubsumptionStrategyTest {
   }
 
   @Test
+  public void testMatchWhenUserAndConjunctsReordered() {
+    // MV has a two-conjunct filter; user writes the same two conjuncts in the opposite order.
+    // AND is commutative, so this must match with zero residual and the base (no-residual) cost.
+    String mvSql = "SELECT a, b, c FROM orders WHERE region = 'US' AND status = 'active'";
+    MvMetadataCache.MvCacheEntry entry = createEntry("mv_orders_OFFLINE", "orders", mvSql);
+
+    PinotQuery userQuery = CalciteSqlParser.compileToPinotQuery(
+        "SELECT a FROM orders WHERE status = 'active' AND region = 'US'");
+    MvRewritePlan result = _strategy.match(userQuery, entry);
+
+    assertNotNull(result, "AND is commutative: reordered conjuncts must match");
+    assertEquals(result.getCost(), 2.0, "Set-equal filters -> no-residual cost");
+    assertNull(result.getMvQuery().getFilterExpression(),
+        "No residual — the rewritten MV query should have no filter");
+  }
+
+  @Test
+  public void testMatchWhenUserNestedAndEquivalentToFlatMvAnd() {
+    // MV has a flat 3-way AND; user's filter is nested and reordered. flattenAnd normalizes both.
+    String mvSql = "SELECT a, b, c FROM orders WHERE region = 'US' AND status = 'active' AND tier = 'gold'";
+    MvMetadataCache.MvCacheEntry entry = createEntry("mv_orders_OFFLINE", "orders", mvSql);
+
+    PinotQuery userQuery = CalciteSqlParser.compileToPinotQuery(
+        "SELECT a FROM orders WHERE tier = 'gold' AND (status = 'active' AND region = 'US')");
+    MvRewritePlan result = _strategy.match(userQuery, entry);
+
+    assertNotNull(result, "Nested AND with same leaves must match a flat AND");
+    assertEquals(result.getCost(), 2.0);
+    assertNull(result.getMvQuery().getFilterExpression());
+  }
+
+  @Test
   public void testProjectionSubsetMvNoFilterUserNoFilter() {
     String mvSql = "SELECT a, b, c FROM orders";
     MvMetadataCache.MvCacheEntry entry = createEntry("mv_orders_OFFLINE", "orders", mvSql);

@@ -46,7 +46,10 @@ public class MaterializedViewMetadataTest {
     Map<String, String> partitionExprMaps = new HashMap<>();
     partitionExprMaps.put("DaysSinceEpoch", "DaysSinceEpoch");
 
-    MvSplitSpec splitSpec = new MvSplitSpec("ts", "1:MILLISECONDS:EPOCH", 86400000L);
+    MvSplitSpec splitSpec = new MvSplitSpec(
+        "ts", "1:MILLISECONDS:EPOCH",
+        "DaysSinceEpoch", "1:DAYS:EPOCH",
+        86400000L);
 
     MvDefinitionMetadata original = new MvDefinitionMetadata(
         mvTableName,
@@ -69,6 +72,8 @@ public class MaterializedViewMetadataTest {
     assertNotNull(restoredSpec);
     assertEquals(restoredSpec.getSourceTimeColumn(), "ts");
     assertEquals(restoredSpec.getSourceTimeFormat(), "1:MILLISECONDS:EPOCH");
+    assertEquals(restoredSpec.getMvTimeColumn(), "DaysSinceEpoch");
+    assertEquals(restoredSpec.getMvTimeFormat(), "1:DAYS:EPOCH");
     assertEquals(restoredSpec.getBucketMs(), 86400000L);
   }
 

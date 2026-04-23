@@ -2380,6 +2380,25 @@ public abstract class BaseSingleStageBrokerRequestHandler extends BaseBrokerRequ
     PinotQuery mvPinotQuery = compileResult._mvServerPinotQuery.deepCopy();
     mvPinotQuery.getQueryOptions().remove(QueryOptionKey.SERVER_RETURN_FINAL_RESULT);
     mvPinotQuery.getQueryOptions().remove(QueryOptionKey.SERVER_RETURN_FINAL_RESULT_KEY_UNPARTITIONED);
+
+    // Attach the complementary upper-bound filter on the MV branch. Without this,
+    // the broker's view of coverageUpperMs in ZK can lag behind the executor's
+    // endSegmentReplace call (non-atomic publish window). During that window, rows
+    // in [U_observed, U_actual) are visible both on the base branch (ts >= U_observed)
+    // and on the MV branch (already-materialized segments with no upper-bound filter),
+    // leading to double-counting. Attaching mvTime < U_observed here keeps the two
+    // sides of the split disjoint regardless of whether the broker sees U_observed
+    // or U_actual, since MV segments contain ts < bucketEnd and coverageUpperMs is
+    // always aligned to a sealed bucketEnd.
+    // MvQueryRewriteEngine.resolvePlan guarantees these fields are non-null/non-empty
+    // when the plan reaches SPLIT_REWRITE execution.
+    String mvTimeColumn = splitSpec.getMvTimeColumn();
+    String mvTimeFormat = splitSpec.getMvTimeFormat();
+    DateTimeFormatSpec mvTimeFormatSpec = new DateTimeFormatSpec(mvTimeFormat);
+    String convertedMvTimeValue = mvTimeFormatSpec.fromMillisToFormat(boundaryTimeMs);
+    TimeBoundaryInfo mvBoundary = new TimeBoundaryInfo(mvTimeColumn, convertedMvTimeValue);
+    attachMvSplitTimeUpperBound(mvPinotQuery, mvBoundary); // mvTime < boundary
+
     _queryOptimizer.optimize(mvPinotQuery, compileResult._mvSchema);
 
     TableRouteInfo mvRouteInfo =
@@ -2405,9 +2424,10 @@ public abstract class BaseSingleStageBrokerRequestHandler extends BaseBrokerRequ
 
     String baseRouteType = baseRouteInfo.isHybrid() ? "HYBRID" : (baseRouteInfo.isOffline() ? "OFFLINE" : "REALTIME");
     LOGGER.info("MV split execution for request {}: baseTable={} ({}), mvTable={}, boundaryTimeMs={}, "
-            + "convertedBoundary={} (column={}), baseOffline={}, baseRealtime={}",
+            + "baseBoundary={} (column={}), mvBoundary={} (column={}), baseOffline={}, baseRealtime={}",
         requestId, compileResult._tableName, baseRouteType, compileResult._mvTableName, boundaryTimeMs,
         convertedTimeValue, baseTimeColumn,
+        convertedMvTimeValue, mvTimeColumn,
         baseRouteInfo.getOfflineBrokerRequest() != null, baseRouteInfo.getRealtimeBrokerRequest() != null);
 
     return processMvSplitBrokerRequest(requestId, reduceBrokerRequest,
@@ -2493,6 +2513,45 @@ public abstract class BaseSingleStageBrokerRequestHandler extends BaseBrokerRequ
     String timeValue = timeBoundaryInfo.getTimeValue();
     Expression timeFilterExpression = RequestUtils.getFunctionExpression(
         FilterKind.GREATER_THAN_OR_EQUAL.name(),
+        RequestUtils.getIdentifierExpression(timeColumn),
+        RequestUtils.getLiteralExpression(timeValue));
+
+    Expression filterExpression = pinotQuery.getFilterExpression();
+    if (filterExpression != null) {
+      pinotQuery.setFilterExpression(
+          RequestUtils.getFunctionExpression(FilterKind.AND.name(), filterExpression, timeFilterExpression));
+    } else {
+      pinotQuery.setFilterExpression(timeFilterExpression);
+    }
+  }
+
+  /**
+   * Attaches a {@code mvTime < boundary} filter for the MV branch of split mode. This is
+   * the complement of {@link #attachMvSplitTimeBoundary} on the base branch:
+   * <ul>
+   *   <li>base: {@code sourceTime >= boundary} covers {@code [boundary, +inf)}</li>
+   *   <li>MV:   {@code mvTime    <  boundary} covers {@code [-inf, boundary)}</li>
+   * </ul>
+   *
+   * <p>{@code LESS_THAN} (exclusive) is correct because minion seals buckets as
+   * {@code [bucketStart, bucketEnd)} and advances {@code coverageUpperMs} to
+   * {@code bucketEnd}, so MV never contains a row with {@code mvTime == boundary}.
+   * Pairing {@code <} on MV with {@code >=} on base makes the two halves of the
+   * timeline disjoint and exhaustive.
+   *
+   * <p>The filter also guards against the non-atomic window between the executor's
+   * {@code endSegmentReplace} (new MV segments become visible on servers) and its
+   * {@code postProcess} (ZK {@code coverageUpperMs} advances). During that window
+   * the broker may observe a stale {@code coverageUpperMs = U_old}; without this
+   * filter the MV branch would return already-materialized rows in
+   * {@code [U_old, U_new)} that the base branch also reads, producing double counts.
+   */
+  @VisibleForTesting
+  static void attachMvSplitTimeUpperBound(PinotQuery pinotQuery, TimeBoundaryInfo timeBoundaryInfo) {
+    String timeColumn = timeBoundaryInfo.getTimeColumn();
+    String timeValue = timeBoundaryInfo.getTimeValue();
+    Expression timeFilterExpression = RequestUtils.getFunctionExpression(
+        FilterKind.LESS_THAN.name(),
         RequestUtils.getIdentifierExpression(timeColumn),
         RequestUtils.getLiteralExpression(timeValue));
 

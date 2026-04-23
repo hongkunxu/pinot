@@ -793,4 +793,53 @@ public class BaseSingleStageBrokerRequestHandlerTest {
         "RLS filter lookup must use base table '" + baseRawTable
             + "' not MV table, but got: " + rlsTable);
   }
+
+  // ---------------------------------------------------------------------------
+  // attachMvSplitTimeUpperBound: unit tests for the MV-branch filter.
+  //
+  // The MV branch of a split query must get `mvTime < coverageUpperMs` to stay
+  // disjoint from the base branch's `sourceTime >= coverageUpperMs`, even when
+  // the user query already carries its own WHERE clause.
+  // ---------------------------------------------------------------------------
+
+  @Test
+  public void testAttachMvSplitTimeUpperBoundOnEmptyFilter() {
+    PinotQuery query = org.apache.pinot.sql.parsers.CalciteSqlParser.compileToPinotQuery(
+        "SELECT carrier, SUM(delay) FROM mvTable GROUP BY carrier");
+    Assert.assertNull(query.getFilterExpression(), "precondition: no WHERE clause");
+
+    BaseSingleStageBrokerRequestHandler.attachMvSplitTimeUpperBound(
+        query, new TimeBoundaryInfo("mvDay", "20000"));
+
+    Expression filter = query.getFilterExpression();
+    Assert.assertNotNull(filter, "MV branch must receive the upper-bound filter");
+    Function fn = filter.getFunctionCall();
+    Assert.assertNotNull(fn);
+    Assert.assertEquals(fn.getOperator().toUpperCase(java.util.Locale.ROOT), "LESS_THAN",
+        "MV upper-bound filter must use LESS_THAN (exclusive), symmetric to the base branch's >=");
+    Assert.assertEquals(fn.getOperands().get(0).getIdentifier().getName(), "mvDay");
+  }
+
+  @Test
+  public void testAttachMvSplitTimeUpperBoundWithExistingFilter() {
+    PinotQuery query = org.apache.pinot.sql.parsers.CalciteSqlParser.compileToPinotQuery(
+        "SELECT carrier, SUM(delay) FROM mvTable WHERE carrier = 'AA' GROUP BY carrier");
+    Assert.assertNotNull(query.getFilterExpression(), "precondition: existing WHERE clause");
+
+    BaseSingleStageBrokerRequestHandler.attachMvSplitTimeUpperBound(
+        query, new TimeBoundaryInfo("mvDay", "20000"));
+
+    Expression filter = query.getFilterExpression();
+    Function root = filter.getFunctionCall();
+    Assert.assertNotNull(root);
+    Assert.assertEquals(root.getOperator().toUpperCase(java.util.Locale.ROOT), "AND",
+        "Upper-bound filter must be AND-ed with the user's WHERE, not replace it");
+    Assert.assertEquals(root.getOperands().size(), 2);
+
+    // Second operand is the injected LESS_THAN(mvDay, 20000).
+    Function injected = root.getOperands().get(1).getFunctionCall();
+    Assert.assertNotNull(injected);
+    Assert.assertEquals(injected.getOperator().toUpperCase(java.util.Locale.ROOT), "LESS_THAN");
+    Assert.assertEquals(injected.getOperands().get(0).getIdentifier().getName(), "mvDay");
+  }
 }

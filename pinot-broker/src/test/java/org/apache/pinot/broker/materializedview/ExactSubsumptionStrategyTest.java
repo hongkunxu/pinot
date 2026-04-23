@@ -131,6 +131,24 @@ public class ExactSubsumptionStrategyTest {
   }
 
   @Test
+  public void testExactMatchWithAndConjunctsReordered() {
+    String definedSql =
+        "SELECT city, SUM(revenue) AS sum_revenue FROM orders WHERE region = 'US' AND status = 'active' "
+            + "GROUP BY city";
+    MvMetadataCache.MvCacheEntry entry = createEntry("mv_orders_OFFLINE", "orders", definedSql);
+
+    // User writes the same two AND conjuncts in the opposite order.
+    PinotQuery userQuery = CalciteSqlParser.compileToPinotQuery(
+        "SELECT city, SUM(revenue) FROM orders WHERE status = 'active' AND region = 'US' GROUP BY city");
+    MvRewritePlan result = _strategy.match(userQuery, entry);
+
+    assertNotNull(result, "AND is commutative: reordered conjuncts must still match exactly");
+    assertEquals(result.getCost(), 0.0);
+    assertNull(result.getMvQuery().getFilterExpression(),
+        "Exact match drops the filter — MV already enforces it");
+  }
+
+  @Test
   public void testNoMatchCompletelyDifferentFilter() {
     String definedSql =
         "SELECT city, SUM(revenue) AS sum_revenue FROM orders WHERE region = 'US' GROUP BY city";

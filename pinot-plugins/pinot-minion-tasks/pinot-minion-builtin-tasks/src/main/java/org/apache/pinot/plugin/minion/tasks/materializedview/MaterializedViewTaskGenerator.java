@@ -400,6 +400,40 @@ public class MaterializedViewTaskGenerator extends BaseTaskGenerator {
   }
 
   /**
+   * Resolves the MV table's designated time column from its {@link TableConfig}. The MV
+   * side of a split query filters on this column (e.g. {@code mvTime < coverageUpperMs}),
+   * which may differ from the source time column when the defined SQL renames or buckets
+   * the time via a {@code dateTimeConvert}/{@code DATETRUNC} expression.
+   */
+  private String resolveMvTimeColumn(String mvTableWithType) {
+    TableConfig mvTableConfig = _clusterInfoAccessor.getTableConfig(mvTableWithType);
+    Preconditions.checkState(mvTableConfig != null,
+        "MV table config not found for: %s", mvTableWithType);
+
+    String timeColumn = mvTableConfig.getValidationConfig().getTimeColumnName();
+    Preconditions.checkState(timeColumn != null && !timeColumn.isEmpty(),
+        "Time column not configured for MV table: %s (required for split queries)", mvTableWithType);
+    return timeColumn;
+  }
+
+  /**
+   * Resolves the raw format string for the MV table's time column, for persisting in
+   * {@link MvDefinitionMetadata.MvSplitSpec}. Used by the broker to convert
+   * {@code coverageUpperMs} (epoch millis) into the MV column's native format before
+   * attaching the {@code mvTime < boundary} filter on the MV branch of a split query.
+   */
+  private String resolveMvTimeFormat(String mvTableWithType, String mvTimeColumn) {
+    Schema mvSchema = _clusterInfoAccessor.getTableSchema(mvTableWithType);
+    Preconditions.checkState(mvSchema != null,
+        "Schema not found for MV table: %s", mvTableWithType);
+
+    DateTimeFieldSpec fieldSpec = mvSchema.getSpecForTimeColumn(mvTimeColumn);
+    Preconditions.checkState(fieldSpec != null,
+        "No DateTimeFieldSpec found for time column '%s' in MV table: %s", mvTimeColumn, mvTableWithType);
+    return fieldSpec.getFormat();
+  }
+
+  /**
    * Appends a time-range WHERE clause to the SQL. The window values must already be in the
    * time column's native format (e.g. days since epoch, not milliseconds). If a WHERE clause
    * already exists, appends with AND; otherwise inserts before GROUP BY / ORDER BY / the
@@ -515,11 +549,17 @@ public class MaterializedViewTaskGenerator extends BaseTaskGenerator {
         ? MaterializedViewAnalyzer.extractPartitionExprMaps(definedSQL, mvSchema)
         : new HashMap<>();
 
-    // Resolve split spec from the source table's time column
+    // Resolve split spec from both the source and MV tables' time columns. The MV-side
+    // fields are required because the broker's split-query handler needs to attach a
+    // complementary `mvTime < coverageUpperMs` filter on the MV branch, symmetric to the
+    // `sourceTime >= coverageUpperMs` filter on the base branch. Persisting the MV
+    // column + format in ZK avoids having the broker re-derive them at query time.
     String sourceTimeColumn = resolveSourceTimeColumn(sourceTableName);
     String sourceTimeFormat = resolveSourceTimeFormat(sourceTableName, sourceTimeColumn);
+    String mvTimeColumn = resolveMvTimeColumn(mvTableWithType);
+    String mvTimeFormat = resolveMvTimeFormat(mvTableWithType, mvTimeColumn);
     MvDefinitionMetadata.MvSplitSpec splitSpec = new MvDefinitionMetadata.MvSplitSpec(
-        sourceTimeColumn, sourceTimeFormat, bucketMs);
+        sourceTimeColumn, sourceTimeFormat, mvTimeColumn, mvTimeFormat, bucketMs);
 
     MvDefinitionMetadata definition = new MvDefinitionMetadata(
         mvTableWithType,

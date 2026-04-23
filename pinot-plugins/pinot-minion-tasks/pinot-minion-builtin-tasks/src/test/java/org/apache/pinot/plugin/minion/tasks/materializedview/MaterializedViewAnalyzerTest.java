@@ -136,7 +136,12 @@ public class MaterializedViewAnalyzerTest {
         .addDateTime("weekBucket", FieldSpec.DataType.LONG, "1:DAYS:EPOCH", "7:DAYS")
         .build();
 
-    TableConfig mvTableConfig = buildMvTableConfig();
+    // The MV renames the time column via dateTimeConvert, so segmentsConfig.timeColumnName must
+    // point to the SELECT alias 'weekBucket' — not the inherited base name.
+    TableConfig mvTableConfig = new TableConfigBuilder(TableType.OFFLINE)
+        .setTableName("mv_orders")
+        .setTimeColumnName("weekBucket")
+        .build();
     Map<String, String> taskConfigs = buildTaskConfigs(sql);
 
     MaterializedViewAnalyzer.AnalysisResult result =
@@ -499,6 +504,142 @@ public class MaterializedViewAnalyzerTest {
 
     assertNotNull(result);
     assertEquals(result.getSourceTableName(), "rt_orders");
+  }
+
+  // -----------------------------------------------------------------------
+  //  Step 6: MV time-column alignment (segmentsConfig.timeColumnName)
+  // -----------------------------------------------------------------------
+
+  @Test
+  public void testRejectsWhenMvTimeColumnMissing() {
+    String sql = "SELECT DaysSinceEpoch, city, count(*) AS cnt FROM orders GROUP BY DaysSinceEpoch, city";
+    Schema mvSchema = new Schema.SchemaBuilder()
+        .addSingleValueDimension("city", FieldSpec.DataType.STRING)
+        .addMetric("cnt", FieldSpec.DataType.LONG)
+        .addDateTime(TIME_COLUMN, FieldSpec.DataType.LONG, "1:DAYS:EPOCH", "1:DAYS")
+        .build();
+
+    TableConfig mvTableConfig = new TableConfigBuilder(TableType.OFFLINE)
+        .setTableName("mv_orders")
+        .build();
+    Map<String, String> taskConfigs = buildTaskConfigs(sql);
+
+    try {
+      MaterializedViewAnalyzer.analyze(withLimit(sql), mvTableConfig, mvSchema, taskConfigs, _mockAccessor);
+      fail("Expected IllegalStateException for unset MV timeColumnName");
+    } catch (IllegalStateException e) {
+      assertTrue(e.getMessage().contains("segmentsConfig.timeColumnName must be set"),
+          "Unexpected message: " + e.getMessage());
+    }
+  }
+
+  @Test
+  public void testRejectsWhenMvTimeColumnNotInSchema() {
+    String sql = "SELECT DaysSinceEpoch, city, count(*) AS cnt FROM orders GROUP BY DaysSinceEpoch, city";
+    Schema mvSchema = new Schema.SchemaBuilder()
+        .addSingleValueDimension("city", FieldSpec.DataType.STRING)
+        .addMetric("cnt", FieldSpec.DataType.LONG)
+        .addDateTime(TIME_COLUMN, FieldSpec.DataType.LONG, "1:DAYS:EPOCH", "1:DAYS")
+        .build();
+
+    // timeColumnName points to a column that doesn't exist in the MV schema at all.
+    TableConfig mvTableConfig = new TableConfigBuilder(TableType.OFFLINE)
+        .setTableName("mv_orders")
+        .setTimeColumnName("nonexistent_time_col")
+        .build();
+    Map<String, String> taskConfigs = buildTaskConfigs(sql);
+
+    try {
+      MaterializedViewAnalyzer.analyze(withLimit(sql), mvTableConfig, mvSchema, taskConfigs, _mockAccessor);
+      fail("Expected IllegalStateException for MV timeColumnName missing from schema");
+    } catch (IllegalStateException e) {
+      assertTrue(e.getMessage().contains("MV time column 'nonexistent_time_col' does not exist in MV schema"),
+          "Unexpected message: " + e.getMessage());
+    }
+  }
+
+  @Test
+  public void testRejectsWhenMvTimeColumnIsNotDateTime() {
+    String sql = "SELECT DaysSinceEpoch, city, count(*) AS cnt FROM orders GROUP BY DaysSinceEpoch, city";
+    Schema mvSchema = new Schema.SchemaBuilder()
+        .addSingleValueDimension("city", FieldSpec.DataType.STRING)
+        .addMetric("cnt", FieldSpec.DataType.LONG)
+        .addDateTime(TIME_COLUMN, FieldSpec.DataType.LONG, "1:DAYS:EPOCH", "1:DAYS")
+        .build();
+
+    // timeColumnName points to a plain dimension, not a registered dateTime column.
+    TableConfig mvTableConfig = new TableConfigBuilder(TableType.OFFLINE)
+        .setTableName("mv_orders")
+        .setTimeColumnName("city")
+        .build();
+    Map<String, String> taskConfigs = buildTaskConfigs(sql);
+
+    try {
+      MaterializedViewAnalyzer.analyze(withLimit(sql), mvTableConfig, mvSchema, taskConfigs, _mockAccessor);
+      fail("Expected IllegalStateException for MV timeColumnName not being a dateTime column");
+    } catch (IllegalStateException e) {
+      assertTrue(e.getMessage().contains("is not a dateTime field in the MV schema"),
+          "Unexpected message: " + e.getMessage());
+    }
+  }
+
+  @Test
+  public void testRejectsWhenMvTimeColumnNotProducedBySelect() {
+    // Simulates the real-world misconfig: base table time column is DaysSinceEpoch; the
+    // definedSql transforms it via date_trunc into a coarser 'day' column; but the MV
+    // TableConfig inherited timeColumnName=DaysSinceEpoch from the base table without
+    // updating it. The MV will not physically contain DaysSinceEpoch.
+    String sql = "SELECT date_trunc('DAY', DaysSinceEpoch) AS day, city, count(*) AS cnt "
+        + "FROM orders GROUP BY day, city";
+    Schema mvSchema = new Schema.SchemaBuilder()
+        .addSingleValueDimension("city", FieldSpec.DataType.STRING)
+        .addMetric("cnt", FieldSpec.DataType.LONG)
+        .addDateTime("day", FieldSpec.DataType.LONG, "1:DAYS:EPOCH", "1:DAYS")
+        .build();
+
+    TableConfig mvTableConfig = new TableConfigBuilder(TableType.OFFLINE)
+        .setTableName("mv_orders")
+        .setTimeColumnName(TIME_COLUMN)
+        .build();
+    Map<String, String> taskConfigs = buildTaskConfigs(sql);
+
+    try {
+      MaterializedViewAnalyzer.analyze(withLimit(sql), mvTableConfig, mvSchema, taskConfigs, _mockAccessor);
+      fail("Expected IllegalStateException for MV timeColumnName not produced by SELECT");
+    } catch (IllegalStateException e) {
+      // The column is absent from the MV schema entirely, so invariant (b) fires first
+      // with a message that still points the user to the root cause.
+      assertTrue(e.getMessage().contains("MV time column '" + TIME_COLUMN + "' does not exist in MV schema"),
+          "Unexpected message: " + e.getMessage());
+    }
+  }
+
+  @Test
+  public void testAcceptsWhenMvTimeColumnIsSelectAlias() {
+    // Happy path mirroring the previous test but with timeColumnName correctly set to
+    // the SELECT-produced alias 'day'.
+    String sql = "SELECT date_trunc('DAY', DaysSinceEpoch) AS day, city, count(*) AS cnt "
+        + "FROM orders GROUP BY day, city";
+    Schema mvSchema = new Schema.SchemaBuilder()
+        .addSingleValueDimension("city", FieldSpec.DataType.STRING)
+        .addMetric("cnt", FieldSpec.DataType.LONG)
+        .addDateTime("day", FieldSpec.DataType.LONG, "1:DAYS:EPOCH", "1:DAYS")
+        .build();
+
+    TableConfig mvTableConfig = new TableConfigBuilder(TableType.OFFLINE)
+        .setTableName("mv_orders")
+        .setTimeColumnName("day")
+        .build();
+    Map<String, String> taskConfigs = buildTaskConfigs(sql);
+
+    MaterializedViewAnalyzer.AnalysisResult result =
+        MaterializedViewAnalyzer.analyze(withLimit(sql), mvTableConfig, mvSchema, taskConfigs, _mockAccessor);
+
+    assertNotNull(result);
+    assertEquals(result.getPartitionExprMaps().size(), 1);
+    assertTrue(result.getPartitionExprMaps().containsValue("day"),
+        "Expected partitionExprMaps to map some base-table expression -> 'day', got: "
+            + result.getPartitionExprMaps());
   }
 
   // -----------------------------------------------------------------------
