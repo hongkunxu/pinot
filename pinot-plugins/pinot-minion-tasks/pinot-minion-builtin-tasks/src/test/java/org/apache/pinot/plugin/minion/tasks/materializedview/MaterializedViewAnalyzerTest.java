@@ -22,8 +22,12 @@ import java.util.HashMap;
 import java.util.Map;
 import org.apache.pinot.controller.helix.core.minion.ClusterInfoAccessor;
 import org.apache.pinot.core.common.MinionConstants.MaterializedViewTask;
+import org.apache.pinot.spi.config.table.DedupConfig;
 import org.apache.pinot.spi.config.table.TableConfig;
 import org.apache.pinot.spi.config.table.TableType;
+import org.apache.pinot.spi.config.table.UpsertConfig;
+import org.apache.pinot.spi.config.table.ingestion.BatchIngestionConfig;
+import org.apache.pinot.spi.config.table.ingestion.IngestionConfig;
 import org.apache.pinot.spi.data.FieldSpec;
 import org.apache.pinot.spi.data.Schema;
 import org.apache.pinot.spi.utils.builder.TableConfigBuilder;
@@ -318,6 +322,142 @@ public class MaterializedViewAnalyzerTest {
         .build();
 
     expectError(sql, mvSchema, "No DateTimeFieldSpec found");
+  }
+
+  // -----------------------------------------------------------------------
+  //  Source-table type eligibility (Step 2): MV's coverage model assumes the base table is
+  //  append-only with monotonically advancing time. Tables whose contents can be replaced or
+  //  rewritten silently — upsert, dedup, dimension, REFRESH-push — must be rejected at create
+  //  time so a known-broken MV cannot land in cluster metadata.
+  // -----------------------------------------------------------------------
+
+  @Test
+  public void testRejectsUpsertSourceTable() {
+    // Upsert: in-place row replacement breaks the assumption that a VALID time partition is
+    // immutable; a late update to a covered interval would silently diverge from the MV.
+    String mutableTable = "orders_upsert";
+    TableConfig upsertCfg = new TableConfigBuilder(TableType.REALTIME)
+        .setTableName(mutableTable)
+        .setTimeColumnName(TIME_COLUMN)
+        .setUpsertConfig(new UpsertConfig(UpsertConfig.Mode.FULL))
+        .build();
+    Schema schema = new Schema.SchemaBuilder()
+        .addSingleValueDimension("city", FieldSpec.DataType.STRING)
+        .addDateTime(TIME_COLUMN, FieldSpec.DataType.LONG, "1:DAYS:EPOCH", "1:DAYS")
+        .build();
+    when(_mockAccessor.getTableConfig(mutableTable + "_OFFLINE")).thenReturn(null);
+    when(_mockAccessor.getTableConfig(mutableTable + "_REALTIME")).thenReturn(upsertCfg);
+    when(_mockAccessor.getTableSchema(mutableTable + "_REALTIME")).thenReturn(schema);
+
+    String sql = "SELECT DaysSinceEpoch, city FROM " + mutableTable + " GROUP BY DaysSinceEpoch, city";
+    Schema mvSchema = new Schema.SchemaBuilder()
+        .addSingleValueDimension("city", FieldSpec.DataType.STRING)
+        .addDateTime(TIME_COLUMN, FieldSpec.DataType.LONG, "1:DAYS:EPOCH", "1:DAYS")
+        .build();
+    expectError(sql, mvSchema, "upsert enabled");
+  }
+
+  @Test
+  public void testRejectsDedupSourceTable() {
+    // Dedup: the de-duplicated view is server-managed and not stable across reloads/TTLs;
+    // MV would aggregate over a snapshot that the runtime can later disagree with.
+    String dedupTable = "orders_dedup";
+    TableConfig dedupCfg = new TableConfigBuilder(TableType.REALTIME)
+        .setTableName(dedupTable)
+        .setTimeColumnName(TIME_COLUMN)
+        .setDedupConfig(new DedupConfig(true, null))
+        .build();
+    Schema schema = new Schema.SchemaBuilder()
+        .addSingleValueDimension("city", FieldSpec.DataType.STRING)
+        .addDateTime(TIME_COLUMN, FieldSpec.DataType.LONG, "1:DAYS:EPOCH", "1:DAYS")
+        .build();
+    when(_mockAccessor.getTableConfig(dedupTable + "_OFFLINE")).thenReturn(null);
+    when(_mockAccessor.getTableConfig(dedupTable + "_REALTIME")).thenReturn(dedupCfg);
+    when(_mockAccessor.getTableSchema(dedupTable + "_REALTIME")).thenReturn(schema);
+
+    String sql = "SELECT DaysSinceEpoch, city FROM " + dedupTable + " GROUP BY DaysSinceEpoch, city";
+    Schema mvSchema = new Schema.SchemaBuilder()
+        .addSingleValueDimension("city", FieldSpec.DataType.STRING)
+        .addDateTime(TIME_COLUMN, FieldSpec.DataType.LONG, "1:DAYS:EPOCH", "1:DAYS")
+        .build();
+    expectError(sql, mvSchema, "dedup enabled");
+  }
+
+  @Test
+  public void testRejectsDimensionSourceTable() {
+    // Dimension table: fully replaced on every refresh and has no monotonic time concept;
+    // the MV's coverageUpperMs model is meaningless here.
+    String dimTable = "dim_lookup";
+    TableConfig dimCfg = new TableConfigBuilder(TableType.OFFLINE)
+        .setTableName(dimTable)
+        .setTimeColumnName(TIME_COLUMN)
+        .setIsDimTable(true)
+        .build();
+    Schema schema = new Schema.SchemaBuilder()
+        .addSingleValueDimension("city", FieldSpec.DataType.STRING)
+        .addDateTime(TIME_COLUMN, FieldSpec.DataType.LONG, "1:DAYS:EPOCH", "1:DAYS")
+        .build();
+    when(_mockAccessor.getTableConfig(dimTable + "_OFFLINE")).thenReturn(dimCfg);
+    when(_mockAccessor.getTableSchema(dimTable + "_OFFLINE")).thenReturn(schema);
+
+    String sql = "SELECT DaysSinceEpoch, city FROM " + dimTable + " GROUP BY DaysSinceEpoch, city";
+    Schema mvSchema = new Schema.SchemaBuilder()
+        .addSingleValueDimension("city", FieldSpec.DataType.STRING)
+        .addDateTime(TIME_COLUMN, FieldSpec.DataType.LONG, "1:DAYS:EPOCH", "1:DAYS")
+        .build();
+    expectError(sql, mvSchema, "dimension table");
+  }
+
+  @Test
+  public void testRejectsRefreshPushTable() {
+    // REFRESH push: each push wholesale replaces base segments, so any MV partition already
+    // marked VALID becomes immediately suspect after the next push.
+    String refreshTable = "orders_refresh";
+    IngestionConfig ingestionCfg = new IngestionConfig();
+    ingestionCfg.setBatchIngestionConfig(new BatchIngestionConfig(null, "REFRESH", "DAILY"));
+    TableConfig refreshCfg = new TableConfigBuilder(TableType.OFFLINE)
+        .setTableName(refreshTable)
+        .setTimeColumnName(TIME_COLUMN)
+        .setIngestionConfig(ingestionCfg)
+        .build();
+    Schema schema = new Schema.SchemaBuilder()
+        .addSingleValueDimension("city", FieldSpec.DataType.STRING)
+        .addDateTime(TIME_COLUMN, FieldSpec.DataType.LONG, "1:DAYS:EPOCH", "1:DAYS")
+        .build();
+    when(_mockAccessor.getTableConfig(refreshTable + "_OFFLINE")).thenReturn(refreshCfg);
+    when(_mockAccessor.getTableSchema(refreshTable + "_OFFLINE")).thenReturn(schema);
+
+    String sql = "SELECT DaysSinceEpoch, city FROM " + refreshTable + " GROUP BY DaysSinceEpoch, city";
+    Schema mvSchema = new Schema.SchemaBuilder()
+        .addSingleValueDimension("city", FieldSpec.DataType.STRING)
+        .addDateTime(TIME_COLUMN, FieldSpec.DataType.LONG, "1:DAYS:EPOCH", "1:DAYS")
+        .build();
+    expectError(sql, mvSchema, "REFRESH push type");
+  }
+
+  @Test
+  public void testRejectsRefreshPushTableViaLegacyField() {
+    // Legacy: REFRESH was set via the deprecated SegmentsValidationAndRetentionConfig field.
+    // resolveSegmentPushType must fall through to it so older configs cannot bypass the guard.
+    String refreshTable = "orders_refresh_legacy";
+    TableConfig refreshCfg = new TableConfigBuilder(TableType.OFFLINE)
+        .setTableName(refreshTable)
+        .setTimeColumnName(TIME_COLUMN)
+        .setSegmentPushType("REFRESH")
+        .build();
+    Schema schema = new Schema.SchemaBuilder()
+        .addSingleValueDimension("city", FieldSpec.DataType.STRING)
+        .addDateTime(TIME_COLUMN, FieldSpec.DataType.LONG, "1:DAYS:EPOCH", "1:DAYS")
+        .build();
+    when(_mockAccessor.getTableConfig(refreshTable + "_OFFLINE")).thenReturn(refreshCfg);
+    when(_mockAccessor.getTableSchema(refreshTable + "_OFFLINE")).thenReturn(schema);
+
+    String sql = "SELECT DaysSinceEpoch, city FROM " + refreshTable + " GROUP BY DaysSinceEpoch, city";
+    Schema mvSchema = new Schema.SchemaBuilder()
+        .addSingleValueDimension("city", FieldSpec.DataType.STRING)
+        .addDateTime(TIME_COLUMN, FieldSpec.DataType.LONG, "1:DAYS:EPOCH", "1:DAYS")
+        .build();
+    expectError(sql, mvSchema, "REFRESH push type");
   }
 
   @Test

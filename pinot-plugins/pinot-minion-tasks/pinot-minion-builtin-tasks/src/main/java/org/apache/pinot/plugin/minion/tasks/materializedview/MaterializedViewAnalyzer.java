@@ -53,7 +53,9 @@ import org.apache.pinot.sql.parsers.SqlCompilationException;
  * Validations performed (in order):
  * <ol>
  *   <li>SQL syntax and semantic analysis via {@link CalciteSqlParser}</li>
- *   <li>Source (base) table existence and time-column configuration</li>
+ *   <li>Source (base) table existence, source-type eligibility (rejects upsert / dedup /
+ *       dimension / REFRESH-push tables whose mutability breaks the MV's immutable-coverage
+ *       assumption), and time-column configuration</li>
  *   <li>Source column existence for all identifiers referenced in the query</li>
  *   <li>MV schema column completeness against the SELECT output fields</li>
  *   <li>Aggregation function recognition</li>
@@ -225,6 +227,36 @@ public final class MaterializedViewAnalyzer {
     String sourceTableWithType = resolveSourceTableWithType(sourceTableName, clusterInfoAccessor);
 
     TableConfig sourceTableConfig = clusterInfoAccessor.getTableConfig(sourceTableWithType);
+
+    // Reject source-table types whose physical contents are mutable in ways that violate the MV's
+    // immutable-coverage assumption. Once a time partition is marked VALID and coverageUpperMs
+    // advances, MV results are served as the truth for that interval; if the base table can later
+    // change rows in that interval (upsert / dedup), be entirely replaced (REFRESH push), or be
+    // re-broadcast wholesale (dim table), the MV will silently disagree with the base. Catching
+    // these at create/update time keeps the bad config out of cluster metadata altogether.
+    Preconditions.checkState(!sourceTableConfig.isUpsertEnabled(),
+        "Source table '%s' has upsert enabled (mode=%s). Materialized views over upsert tables "
+            + "are not supported: out-of-order or late-arriving updates can modify rows in time "
+            + "partitions the MV has already marked VALID, leading to silently stale MV results "
+            + "that the rewriter would still serve.",
+        sourceTableName, sourceTableConfig.getUpsertMode());
+    Preconditions.checkState(!sourceTableConfig.isDedupEnabled(),
+        "Source table '%s' has dedup enabled. Materialized views over dedup tables are not "
+            + "supported: the deduplicated view is server-managed and not stable across segment "
+            + "reloads / TTLs, so MV-side aggregates cannot be guaranteed to match the base.",
+        sourceTableName);
+    Preconditions.checkState(!sourceTableConfig.isDimTable(),
+        "Source table '%s' is a dimension table. Materialized views over dimension tables are "
+            + "not supported: dim tables are fully replaced on every refresh and have no notion "
+            + "of monotonically advancing time, so the MV's coverage model does not apply.",
+        sourceTableName);
+    String pushType = resolveSegmentPushType(sourceTableConfig);
+    Preconditions.checkState(!"REFRESH".equalsIgnoreCase(pushType),
+        "Source table '%s' uses REFRESH push type. Materialized views over REFRESH-push tables "
+            + "are not supported: each push wholesale replaces the base segments, so any time "
+            + "partition the MV has already marked VALID can be invalidated by the next push.",
+        sourceTableName);
+
     String timeColumn = sourceTableConfig.getValidationConfig().getTimeColumnName();
     Preconditions.checkState(timeColumn != null && !timeColumn.isEmpty(),
         "Source table '%s' has no time column configured", sourceTableName);
@@ -237,6 +269,25 @@ public final class MaterializedViewAnalyzer {
         "No DateTimeFieldSpec found for time column '%s' in source table '%s'", timeColumn, sourceTableName);
 
     return sourceTableName;
+  }
+
+  /**
+   * Resolves the segment push type from either the modern {@code IngestionConfig.batchIngestionConfig}
+   * location or the legacy {@code SegmentsValidationAndRetentionConfig.segmentPushType} field.
+   * Returns {@code null} if neither is set, in which case the default behavior (APPEND) is assumed.
+   * Both locations must be checked so REFRESH-push tables created with older table configs cannot
+   * silently slip past the MV source-type guard.
+   */
+  @SuppressWarnings("deprecation")
+  private static String resolveSegmentPushType(TableConfig sourceTableConfig) {
+    if (sourceTableConfig.getIngestionConfig() != null
+        && sourceTableConfig.getIngestionConfig().getBatchIngestionConfig() != null) {
+      String type = sourceTableConfig.getIngestionConfig().getBatchIngestionConfig().getSegmentIngestionType();
+      if (type != null && !type.isEmpty()) {
+        return type;
+      }
+    }
+    return sourceTableConfig.getValidationConfig().getSegmentPushType();
   }
 
   /**
