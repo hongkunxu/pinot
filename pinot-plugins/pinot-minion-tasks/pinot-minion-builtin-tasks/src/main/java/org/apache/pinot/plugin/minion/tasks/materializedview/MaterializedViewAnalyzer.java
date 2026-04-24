@@ -33,6 +33,8 @@ import org.apache.pinot.common.request.PinotQuery;
 import org.apache.pinot.common.utils.request.RequestUtils;
 import org.apache.pinot.controller.helix.core.minion.ClusterInfoAccessor;
 import org.apache.pinot.core.common.MinionConstants.MaterializedViewTask;
+import org.apache.pinot.plugin.minion.tasks.materializedview.timeexpr.InferredTimeSpec;
+import org.apache.pinot.plugin.minion.tasks.materializedview.timeexpr.TimeExprInferrer;
 import org.apache.pinot.segment.spi.AggregationFunctionType;
 import org.apache.pinot.spi.config.table.TableConfig;
 import org.apache.pinot.spi.config.table.TableType;
@@ -58,6 +60,11 @@ import org.apache.pinot.sql.parsers.SqlCompilationException;
  *   <li>Task config parameter validity (bucket period, buffer period, etc.)</li>
  *   <li>MV time column alignment: {@code segmentsConfig.timeColumnName} exists in the MV
  *       schema as a {@link DateTimeFieldSpec} and is produced by a SELECT expression</li>
+ *   <li>MV time column format/granularity: the SELECT expression actually producing the MV
+ *       time column is inferred (via {@link TimeExprInferrer}) and compared against the MV
+ *       {@link DateTimeFieldSpec}'s declared format and granularity. Catches at create time
+ *       silently incorrect setups (wrong format ⇒ wrong split-boundary conversion / wrong
+ *       interval filtering at query time).</li>
  * </ol>
  *
  * <p>Thread-safety: all methods are stateless and static.
@@ -103,14 +110,29 @@ public final class MaterializedViewAnalyzer {
     // Step 3: MV schema column completeness (including dateTime columns)
     Set<String> selectFields = validateMvColumns(pinotQuery, mvSchema);
 
-    // Step 5: extract and validate time column transformation mappings
-    Map<String, String> partitionExprMaps = extractPartitionExprMaps(pinotQuery, mvSchema);
+    // Step 5: extract and validate time column transformation mappings.
+    // We need both the legacy "exprPretty -> mvCol" map (consumed by downstream metadata and by
+    // Step 6) and a parallel "mvCol -> sourceExpr" map so Step 7 can locate the actual SELECT
+    // expression producing each MV dateTime column without re-walking the SELECT list.
+    PartitionExprData partitionExprData = extractPartitionExprData(pinotQuery, mvSchema);
+    Map<String, String> partitionExprMaps = partitionExprData.exprStringToMvCol();
 
     // Step 6: MV time column (segmentsConfig.timeColumnName) must be wired to a SELECT-produced
     // dateTime column. Without this guard, a mismatch (e.g. timeColumnName=ts but SELECT only
     // produces date_trunc('DAY', ts) AS day) would only surface at task scheduling time via the
     // runtime Preconditions in MaterializedViewTaskGenerator#resolveMvTimeColumn / resolveMvTimeFormat.
     validateMvTimeColumnAlignment(mvTableConfig, mvSchema, partitionExprMaps);
+
+    // Step 7: MV time column format/granularity must match what the SELECT expression actually
+    // produces. Without this check, a mismatched DateTimeFieldSpec would only show up at query
+    // time (wrong split-boundary conversion, wrong interval filtering). Step 6 has already
+    // ensured the MV time column exists, is a DateTimeFieldSpec, and is in partitionExprMaps,
+    // so the lookup below is guaranteed non-null.
+    // TODO(mv): v1 only validates segmentsConfig.timeColumnName. Extend to all DateTimeFieldSpec
+    // columns in a follow-up by looping over mvSchema.getDateTimeNames() and re-using the same
+    // inferrer (loosening the "first arg must be base time column" rule there).
+    validateMvTimeColumnFormat(mvTableConfig, mvSchema, sourceTableName,
+        partitionExprData.mvColToSourceExpr(), clusterInfoAccessor);
 
     return new AnalysisResult(sourceTableName, selectFields, partitionExprMaps);
   }
@@ -418,14 +440,27 @@ public final class MaterializedViewAnalyzer {
    * @return map from expression string to MV column name
    */
   static Map<String, String> extractPartitionExprMaps(PinotQuery pinotQuery, Schema mvSchema) {
+    return extractPartitionExprData(pinotQuery, mvSchema).exprStringToMvCol();
+  }
+
+  /**
+   * Internal variant of {@link #extractPartitionExprMaps(PinotQuery, Schema)} that also
+   * returns the {@code mvColName -> sourceExpression} mapping. Step 7 needs the live
+   * {@link Expression} (not just the pretty-printed form) so it can run the time-expression
+   * inferrer.
+   *
+   * <p>Both maps are produced in a single SELECT-list walk to avoid double-traversal.
+   */
+  static PartitionExprData extractPartitionExprData(PinotQuery pinotQuery, Schema mvSchema) {
     List<String> dateTimeNamesList = mvSchema.getDateTimeNames();
     if (dateTimeNamesList.isEmpty()) {
-      return Collections.emptyMap();
+      return PartitionExprData.EMPTY;
     }
 
     Set<String> dateTimeNames = new HashSet<>(dateTimeNamesList);
     List<Expression> selectList = pinotQuery.getSelectList();
     Map<String, String> partitionExprMaps = new HashMap<>();
+    Map<String, Expression> mvColToSourceExpr = new HashMap<>();
 
     for (Expression expr : selectList) {
       String outputName = extractOutputFieldName(expr);
@@ -435,6 +470,7 @@ public final class MaterializedViewAnalyzer {
       Expression sourceExpr = extractSourceExpression(expr);
       String exprString = RequestUtils.prettyPrint(sourceExpr);
       partitionExprMaps.put(exprString, outputName);
+      mvColToSourceExpr.put(outputName, sourceExpr);
     }
 
     Preconditions.checkState(partitionExprMaps.size() == dateTimeNames.size(),
@@ -456,7 +492,7 @@ public final class MaterializedViewAnalyzer {
       }
     }
 
-    return partitionExprMaps;
+    return new PartitionExprData(partitionExprMaps, mvColToSourceExpr);
   }
 
   /**
@@ -505,11 +541,9 @@ public final class MaterializedViewAnalyzer {
    *       values) — i.e. physically present in the MV</li>
    * </ol>
    *
-   * <p>TODO(mv): Invariant (4) establishes the column exists; a stricter future check would
-   * deduce the output format of the producing SELECT expression (e.g.
-   * {@code date_trunc('DAY', ts)} -&gt; {@code 1:MILLISECONDS:EPOCH}) and cross-verify it
-   * against {@code fieldSpec.getFormat()} so a format mismatch is also caught at create
-   * time. That requires a function-to-format registry and is deferred.
+   * <p>The stricter "format/granularity also match what the SELECT expression actually
+   * produces" check is performed by Step 7 ({@link #validateMvTimeColumnFormat}), which
+   * relies on the MV time column already passing invariants (1)–(4) here.
    */
   private static void validateMvTimeColumnAlignment(TableConfig mvTableConfig, Schema mvSchema,
       Map<String, String> partitionExprMaps) {
@@ -536,6 +570,143 @@ public final class MaterializedViewAnalyzer {
         mvTimeColumn,
         partitionExprMaps.values().isEmpty() ? "<none>" : partitionExprMaps.values(),
         mvTimeColumn);
+  }
+
+  // ---------------------------------------------------------------------------
+  //  Step 7 — MV time column format / granularity inference
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Verifies that the SELECT expression producing the MV {@code segmentsConfig.timeColumnName}
+   * yields the same {@code format} (and, where derivable, {@code granularity}) as the MV
+   * {@link DateTimeFieldSpec} declares. Without this check, a misconfiguration only surfaces
+   * at query time as silently wrong split-boundary conversion or interval filtering.
+   *
+   * <p>Preconditions established by Steps 5–6: {@code mvTimeCol} is non-empty, exists in the MV
+   * schema as a {@link DateTimeFieldSpec}, and {@code mvColToSourceExpr} contains an entry for
+   * it. Therefore both lookups below are guaranteed non-null.
+   */
+  private static void validateMvTimeColumnFormat(TableConfig mvTableConfig, Schema mvSchema,
+      String sourceTableName, Map<String, Expression> mvColToSourceExpr,
+      ClusterInfoAccessor clusterInfoAccessor) {
+
+    String mvTimeCol = mvTableConfig.getValidationConfig().getTimeColumnName();
+    Expression sourceExpr = mvColToSourceExpr.get(mvTimeCol);
+    DateTimeFieldSpec mvFieldSpec = mvSchema.getSpecForTimeColumn(mvTimeCol);
+    // Defensive: Steps 5–6 guarantee these non-null. A null here would indicate an internal
+    // ordering bug between steps, not a user-facing error, so fail loudly.
+    Preconditions.checkState(sourceExpr != null,
+        "Internal error: no SELECT source expression recorded for MV time column '%s'.", mvTimeCol);
+    Preconditions.checkState(mvFieldSpec != null,
+        "Internal error: MV time column '%s' has no DateTimeFieldSpec at format-validation step.",
+        mvTimeCol);
+
+    BaseTimeColumn baseTime = resolveBaseTimeColumn(sourceTableName, clusterInfoAccessor);
+
+    InferredTimeSpec inferred = TimeExprInferrer.infer(sourceExpr, baseTime.name(), baseTime.fieldSpec());
+
+    String mvFormat = mvFieldSpec.getFormat();
+    String mvGranularity = mvFieldSpec.getGranularity();
+
+    if (!inferred.formatMatcher().matches(mvFormat)) {
+      throw new IllegalStateException(buildFormatMismatchMessage(mvTimeCol, "format",
+          inferred.formatMatcher().describeExpected(), mvGranularity, mvFormat, mvGranularity,
+          inferred.reason()));
+    }
+
+    String expectedGranularity = inferred.expectedGranularity();
+    if (expectedGranularity != null) {
+      if (!expectedGranularity.equals(mvGranularity)) {
+        throw new IllegalStateException(buildFormatMismatchMessage(mvTimeCol, "granularity",
+            inferred.formatMatcher().describeExpected(), expectedGranularity, mvFormat, mvGranularity,
+            inferred.reason()));
+      }
+    } else {
+      // toDateTime path: we don't infer granularity, but the MV must still declare one so that
+      // downstream split-mode bucketing has a unit to work with.
+      Preconditions.checkState(mvGranularity != null && !mvGranularity.isEmpty(),
+          "MV time column '%s' uses toDateTime in the SELECT expression, which does not infer a "
+              + "granularity. The MV DateTimeFieldSpec must still declare a non-empty 'granularity'. "
+              + "reason: %s",
+          mvTimeCol, inferred.reason());
+    }
+  }
+
+  /**
+   * Builds the unified expected/actual/reason mismatch message used by Step 7. {@code mismatchKind}
+   * is "format" or "granularity" so the heading points the user at the offending field while the
+   * body still prints both expected/actual format <i>and</i> granularity together — date_trunc and
+   * dateTimeConvert have format/granularity coupling that is easy to misread in isolation.
+   */
+  private static String buildFormatMismatchMessage(String mvTimeCol, String mismatchKind,
+      String expectedFormat, String expectedGranularity, String actualFormat, String actualGranularity,
+      String reason) {
+    return "MV time column '" + mvTimeCol + "' " + mismatchKind + " mismatch.\n"
+        + "  expected: format=" + expectedFormat + ", granularity=" + expectedGranularity + "\n"
+        + "  actual:   format=" + actualFormat + ", granularity=" + actualGranularity + "\n"
+        + "  reason:   " + reason;
+  }
+
+  /**
+   * Resolves the base table's primary time column name + its {@link DateTimeFieldSpec}.
+   * Step 2 ({@link #validateSourceTable}) has already enforced that both exist, so any null
+   * here would indicate an internal ordering bug.
+   */
+  private static BaseTimeColumn resolveBaseTimeColumn(String sourceTableName,
+      ClusterInfoAccessor clusterInfoAccessor) {
+    String sourceTableWithType = resolveSourceTableWithType(sourceTableName, clusterInfoAccessor);
+    TableConfig sourceTableConfig = clusterInfoAccessor.getTableConfig(sourceTableWithType);
+    String baseTimeColumn = sourceTableConfig.getValidationConfig().getTimeColumnName();
+    Schema sourceSchema = clusterInfoAccessor.getTableSchema(sourceTableWithType);
+    DateTimeFieldSpec baseFieldSpec = sourceSchema.getSpecForTimeColumn(baseTimeColumn);
+    Preconditions.checkState(baseFieldSpec != null,
+        "Internal error: base table '%s' time column '%s' resolved to null DateTimeFieldSpec at "
+            + "format-validation step.", sourceTableName, baseTimeColumn);
+    return new BaseTimeColumn(baseTimeColumn, baseFieldSpec);
+  }
+
+  /** Holder for the base table's primary time column name + its field spec. */
+  private static final class BaseTimeColumn {
+    private final String _name;
+    private final DateTimeFieldSpec _fieldSpec;
+
+    BaseTimeColumn(String name, DateTimeFieldSpec fieldSpec) {
+      _name = name;
+      _fieldSpec = fieldSpec;
+    }
+
+    String name() {
+      return _name;
+    }
+
+    DateTimeFieldSpec fieldSpec() {
+      return _fieldSpec;
+    }
+  }
+
+  /**
+   * Step-5 output: both the legacy {@code exprPretty -> mvCol} map (consumed by downstream
+   * metadata + Step 6) and the {@code mvCol -> sourceExpr} map (consumed by Step 7).
+   */
+  static final class PartitionExprData {
+    static final PartitionExprData EMPTY =
+        new PartitionExprData(Collections.emptyMap(), Collections.emptyMap());
+
+    private final Map<String, String> _exprStringToMvCol;
+    private final Map<String, Expression> _mvColToSourceExpr;
+
+    PartitionExprData(Map<String, String> exprStringToMvCol, Map<String, Expression> mvColToSourceExpr) {
+      _exprStringToMvCol = exprStringToMvCol;
+      _mvColToSourceExpr = mvColToSourceExpr;
+    }
+
+    Map<String, String> exprStringToMvCol() {
+      return _exprStringToMvCol;
+    }
+
+    Map<String, Expression> mvColToSourceExpr() {
+      return _mvColToSourceExpr;
+    }
   }
 
   // ---------------------------------------------------------------------------

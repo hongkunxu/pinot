@@ -617,8 +617,12 @@ public class MaterializedViewAnalyzerTest {
   @Test
   public void testAcceptsWhenMvTimeColumnIsSelectAlias() {
     // Happy path mirroring the previous test but with timeColumnName correctly set to
-    // the SELECT-produced alias 'day'.
-    String sql = "SELECT date_trunc('DAY', DaysSinceEpoch) AS day, city, count(*) AS cnt "
+    // the SELECT-produced alias 'day'. Note: `inputTimeUnit='DAYS'` is passed explicitly so
+    // Step-7 inference matches the base column unit (Pinot's date_trunc defaults
+    // inputTimeUnit to MILLISECONDS, NOT to the base unit). Granularity is 1:DAYS because
+    // DateTruncRule maps the truncation unit 'DAY' to its TimeUnit equivalent DAYS — the
+    // MV granularity field is parsed via TimeUnit.valueOf and only accepts plural names.
+    String sql = "SELECT date_trunc('DAY', DaysSinceEpoch, 'DAYS') AS day, city, count(*) AS cnt "
         + "FROM orders GROUP BY day, city";
     Schema mvSchema = new Schema.SchemaBuilder()
         .addSingleValueDimension("city", FieldSpec.DataType.STRING)
@@ -640,6 +644,347 @@ public class MaterializedViewAnalyzerTest {
     assertTrue(result.getPartitionExprMaps().containsValue("day"),
         "Expected partitionExprMaps to map some base-table expression -> 'day', got: "
             + result.getPartitionExprMaps());
+  }
+
+  // -----------------------------------------------------------------------
+  //  Step 7: MV time column format / granularity inference (TimeExprInferrer)
+  //
+  //  Each rule in the inferrer (identity, dateTimeConvert, date_trunc, toDateTime)
+  //  is exercised here through analyze() end-to-end with at least one happy and one
+  //  mismatch case. The famous "date_trunc + 1:DAYS:EPOCH" misconception gets its own
+  //  test because users routinely conflate the storage-unit format with the truncation
+  //  granularity, and the Step-7 reason string is what makes the error self-explanatory.
+  // -----------------------------------------------------------------------
+
+  @Test
+  public void testStep7IdentityFormatMismatch() {
+    // Bare identifier: the identity rule requires MV format/granularity to equal base
+    // verbatim. Here MV declares 1:HOURS:EPOCH while base is 1:DAYS:EPOCH — would silently
+    // mis-bucket every time-range filter at query time without this guard.
+    String sql = "SELECT DaysSinceEpoch, city, count(*) AS cnt "
+        + "FROM orders GROUP BY DaysSinceEpoch, city";
+    Schema mvSchema = new Schema.SchemaBuilder()
+        .addSingleValueDimension("city", FieldSpec.DataType.STRING)
+        .addMetric("cnt", FieldSpec.DataType.LONG)
+        .addDateTime(TIME_COLUMN, FieldSpec.DataType.LONG, "1:HOURS:EPOCH", "1:DAYS")
+        .build();
+
+    expectError(sql, mvSchema, "format mismatch");
+  }
+
+  @Test
+  public void testStep7IdentityGranularityMismatch() {
+    // Identity again, format matches but granularity doesn't.
+    String sql = "SELECT DaysSinceEpoch, city, count(*) AS cnt "
+        + "FROM orders GROUP BY DaysSinceEpoch, city";
+    Schema mvSchema = new Schema.SchemaBuilder()
+        .addSingleValueDimension("city", FieldSpec.DataType.STRING)
+        .addMetric("cnt", FieldSpec.DataType.LONG)
+        .addDateTime(TIME_COLUMN, FieldSpec.DataType.LONG, "1:DAYS:EPOCH", "7:DAYS")
+        .build();
+
+    expectError(sql, mvSchema, "granularity mismatch");
+  }
+
+  @Test
+  public void testStep7DateTimeConvertOutputFormatMismatch() {
+    // dateTimeConvert outputFormat='1:DAYS:EPOCH' but MV declares '1:HOURS:EPOCH'.
+    String sql = "SELECT dateTimeConvert(DaysSinceEpoch, '1:DAYS:EPOCH', '1:DAYS:EPOCH', '1:DAYS') "
+        + "AS daily, city, count(*) AS cnt FROM orders "
+        + "GROUP BY dateTimeConvert(DaysSinceEpoch, '1:DAYS:EPOCH', '1:DAYS:EPOCH', '1:DAYS'), city";
+    Schema mvSchema = new Schema.SchemaBuilder()
+        .addSingleValueDimension("city", FieldSpec.DataType.STRING)
+        .addMetric("cnt", FieldSpec.DataType.LONG)
+        .addDateTime("daily", FieldSpec.DataType.LONG, "1:HOURS:EPOCH", "1:DAYS")
+        .build();
+
+    TableConfig mvTableConfig = new TableConfigBuilder(TableType.OFFLINE)
+        .setTableName("mv_orders")
+        .setTimeColumnName("daily")
+        .build();
+    Map<String, String> taskConfigs = buildTaskConfigs(sql);
+
+    expectErrorRaw(withLimit(sql), mvSchema, mvTableConfig, taskConfigs, "format mismatch");
+  }
+
+  @Test
+  public void testStep7DateTimeConvertGranularityMismatch() {
+    // outputFormat matches MV but the declared granularity '7:DAYS' disagrees with MV '1:DAYS'.
+    String sql = "SELECT dateTimeConvert(DaysSinceEpoch, '1:DAYS:EPOCH', '1:DAYS:EPOCH', '7:DAYS') "
+        + "AS weekly, city, count(*) AS cnt FROM orders "
+        + "GROUP BY dateTimeConvert(DaysSinceEpoch, '1:DAYS:EPOCH', '1:DAYS:EPOCH', '7:DAYS'), city";
+    Schema mvSchema = new Schema.SchemaBuilder()
+        .addSingleValueDimension("city", FieldSpec.DataType.STRING)
+        .addMetric("cnt", FieldSpec.DataType.LONG)
+        .addDateTime("weekly", FieldSpec.DataType.LONG, "1:DAYS:EPOCH", "1:DAYS")
+        .build();
+
+    TableConfig mvTableConfig = new TableConfigBuilder(TableType.OFFLINE)
+        .setTableName("mv_orders")
+        .setTimeColumnName("weekly")
+        .build();
+    Map<String, String> taskConfigs = buildTaskConfigs(sql);
+
+    expectErrorRaw(withLimit(sql), mvSchema, mvTableConfig, taskConfigs, "granularity mismatch");
+  }
+
+  @Test
+  public void testStep7DateTimeConvertInputFormatMismatchesBase() {
+    // inputFormat='1:HOURS:EPOCH' lies about the base column (which is '1:DAYS:EPOCH'),
+    // so even if outputFormat aligns with MV, the function will silently re-interpret the
+    // base values. Step-7 catches this at definition time.
+    String sql = "SELECT dateTimeConvert(DaysSinceEpoch, '1:HOURS:EPOCH', '1:DAYS:EPOCH', '1:DAYS') "
+        + "AS daily, city, count(*) AS cnt FROM orders "
+        + "GROUP BY dateTimeConvert(DaysSinceEpoch, '1:HOURS:EPOCH', '1:DAYS:EPOCH', '1:DAYS'), city";
+    Schema mvSchema = new Schema.SchemaBuilder()
+        .addSingleValueDimension("city", FieldSpec.DataType.STRING)
+        .addMetric("cnt", FieldSpec.DataType.LONG)
+        .addDateTime("daily", FieldSpec.DataType.LONG, "1:DAYS:EPOCH", "1:DAYS")
+        .build();
+
+    TableConfig mvTableConfig = new TableConfigBuilder(TableType.OFFLINE)
+        .setTableName("mv_orders")
+        .setTimeColumnName("daily")
+        .build();
+    Map<String, String> taskConfigs = buildTaskConfigs(sql);
+
+    expectErrorRaw(withLimit(sql), mvSchema, mvTableConfig, taskConfigs,
+        "dateTimeConvert inputFormat");
+  }
+
+  @Test
+  public void testStep7DateTruncHappyOnMillisBase() {
+    // Base column is in MILLISECONDS, so date_trunc's default inputTimeUnit (MILLISECONDS)
+    // matches and the rule infers format=1:MILLISECONDS:EPOCH (storage unit), granularity=1:DAYS
+    // (DateTruncRule maps the truncation unit 'DAY' to TimeUnit.DAYS).
+    useMillisecondsBase();
+    String sql = "SELECT date_trunc('DAY', ts) AS day, city, count(*) AS cnt "
+        + "FROM orders_ms GROUP BY day, city";
+    Schema mvSchema = new Schema.SchemaBuilder()
+        .addSingleValueDimension("city", FieldSpec.DataType.STRING)
+        .addMetric("cnt", FieldSpec.DataType.LONG)
+        .addDateTime("day", FieldSpec.DataType.LONG, "1:MILLISECONDS:EPOCH", "1:DAYS")
+        .build();
+
+    TableConfig mvTableConfig = new TableConfigBuilder(TableType.OFFLINE)
+        .setTableName("mv_orders_ms")
+        .setTimeColumnName("day")
+        .build();
+    Map<String, String> taskConfigs = buildTaskConfigs(sql);
+
+    MaterializedViewAnalyzer.AnalysisResult result =
+        MaterializedViewAnalyzer.analyze(withLimit(sql), mvTableConfig, mvSchema, taskConfigs, _mockAccessor);
+
+    assertNotNull(result);
+    assertTrue(result.getPartitionExprMaps().containsValue("day"));
+  }
+
+  @Test
+  public void testStep7DateTruncFormatMisconceptionDaysEpoch() {
+    // Classic user mistake: date_trunc('DAY', ts) returns a long in the *storage* unit
+    // (MILLISECONDS by default), NOT in days. Declaring the MV column as 1:DAYS:EPOCH would
+    // silently divide every value by 86.4M at read time.
+    useMillisecondsBase();
+    String sql = "SELECT date_trunc('DAY', ts) AS day, city, count(*) AS cnt "
+        + "FROM orders_ms GROUP BY day, city";
+    Schema mvSchema = new Schema.SchemaBuilder()
+        .addSingleValueDimension("city", FieldSpec.DataType.STRING)
+        .addMetric("cnt", FieldSpec.DataType.LONG)
+        // BUG: format says DAYS but date_trunc still returns a millis-since-epoch long.
+        .addDateTime("day", FieldSpec.DataType.LONG, "1:DAYS:EPOCH", "1:DAYS")
+        .build();
+
+    TableConfig mvTableConfig = new TableConfigBuilder(TableType.OFFLINE)
+        .setTableName("mv_orders_ms")
+        .setTimeColumnName("day")
+        .build();
+    Map<String, String> taskConfigs = buildTaskConfigs(sql);
+
+    try {
+      MaterializedViewAnalyzer.analyze(withLimit(sql), mvTableConfig, mvSchema, taskConfigs, _mockAccessor);
+      fail("Expected IllegalStateException for date_trunc storage-unit misconception");
+    } catch (IllegalStateException e) {
+      String msg = e.getMessage();
+      assertTrue(msg.contains("format mismatch"), "Unexpected message: " + msg);
+      // Must show what was actually expected (storage unit) so the user can reconcile.
+      assertTrue(msg.contains("1:MILLISECONDS:EPOCH"),
+          "Expected message to surface inferred '1:MILLISECONDS:EPOCH', got: " + msg);
+      // Reason text must explain the storage-vs-granularity gotcha.
+      assertTrue(msg.contains("storage unit"),
+          "Expected reason to mention storage unit, got: " + msg);
+    }
+  }
+
+  @Test
+  public void testStep7DateTruncDefaultInputUnitMismatchesBase() {
+    // Base is in DAYS, but date_trunc with no explicit inputTimeUnit defaults to MILLISECONDS.
+    // The rule rejects this because Pinot's runtime would silently reinterpret day-counts
+    // as milliseconds-since-epoch.
+    String sql = "SELECT date_trunc('DAY', DaysSinceEpoch) AS day, city, count(*) AS cnt "
+        + "FROM orders GROUP BY day, city";
+    Schema mvSchema = new Schema.SchemaBuilder()
+        .addSingleValueDimension("city", FieldSpec.DataType.STRING)
+        .addMetric("cnt", FieldSpec.DataType.LONG)
+        .addDateTime("day", FieldSpec.DataType.LONG, "1:MILLISECONDS:EPOCH", "1:DAYS")
+        .build();
+
+    TableConfig mvTableConfig = new TableConfigBuilder(TableType.OFFLINE)
+        .setTableName("mv_orders")
+        .setTimeColumnName("day")
+        .build();
+    Map<String, String> taskConfigs = buildTaskConfigs(sql);
+
+    expectErrorRaw(withLimit(sql), mvSchema, mvTableConfig, taskConfigs,
+        "date_trunc inputTimeUnit");
+  }
+
+  @Test
+  public void testStep7ToDateTimeHappy() {
+    // toDateTime renders to a SIMPLE_DATE_FORMAT string. Granularity isn't inferred but
+    // must still be declared (any non-empty value is accepted in v1).
+    useMillisecondsBase();
+    String sql = "SELECT toDateTime(ts, 'yyyy-MM-dd') AS dayStr, city, count(*) AS cnt "
+        + "FROM orders_ms GROUP BY dayStr, city";
+    Schema mvSchema = new Schema.SchemaBuilder()
+        .addSingleValueDimension("city", FieldSpec.DataType.STRING)
+        .addMetric("cnt", FieldSpec.DataType.LONG)
+        .addDateTime("dayStr", FieldSpec.DataType.STRING, "1:DAYS:SIMPLE_DATE_FORMAT:yyyy-MM-dd", "1:DAYS")
+        .build();
+
+    TableConfig mvTableConfig = new TableConfigBuilder(TableType.OFFLINE)
+        .setTableName("mv_orders_ms")
+        .setTimeColumnName("dayStr")
+        .build();
+    Map<String, String> taskConfigs = buildTaskConfigs(sql);
+
+    MaterializedViewAnalyzer.AnalysisResult result =
+        MaterializedViewAnalyzer.analyze(withLimit(sql), mvTableConfig, mvSchema, taskConfigs, _mockAccessor);
+
+    assertNotNull(result);
+    assertTrue(result.getPartitionExprMaps().containsValue("dayStr"));
+  }
+
+  @Test
+  public void testStep7ToDateTimePatternMismatch() {
+    // MV pattern 'yyyy-MM' doesn't match the function's 'yyyy-MM-dd'.
+    useMillisecondsBase();
+    String sql = "SELECT toDateTime(ts, 'yyyy-MM-dd') AS dayStr, city, count(*) AS cnt "
+        + "FROM orders_ms GROUP BY dayStr, city";
+    Schema mvSchema = new Schema.SchemaBuilder()
+        .addSingleValueDimension("city", FieldSpec.DataType.STRING)
+        .addMetric("cnt", FieldSpec.DataType.LONG)
+        .addDateTime("dayStr", FieldSpec.DataType.STRING, "1:DAYS:SIMPLE_DATE_FORMAT:yyyy-MM", "1:DAYS")
+        .build();
+
+    TableConfig mvTableConfig = new TableConfigBuilder(TableType.OFFLINE)
+        .setTableName("mv_orders_ms")
+        .setTimeColumnName("dayStr")
+        .build();
+    Map<String, String> taskConfigs = buildTaskConfigs(sql);
+
+    expectErrorRaw(withLimit(sql), mvSchema, mvTableConfig, taskConfigs, "format mismatch");
+  }
+
+  @Test
+  public void testStep7ToDateTimeMvFormatNotSdf() {
+    // toDateTime requires MV format to be SIMPLE_DATE_FORMAT-style; an EPOCH format here is
+    // a structural mismatch caught by the SdfPatternFormatMatcher.
+    useMillisecondsBase();
+    String sql = "SELECT toDateTime(ts, 'yyyy-MM-dd') AS dayStr, city, count(*) AS cnt "
+        + "FROM orders_ms GROUP BY dayStr, city";
+    Schema mvSchema = new Schema.SchemaBuilder()
+        .addSingleValueDimension("city", FieldSpec.DataType.STRING)
+        .addMetric("cnt", FieldSpec.DataType.LONG)
+        .addDateTime("dayStr", FieldSpec.DataType.STRING, "1:MILLISECONDS:EPOCH", "1:DAYS")
+        .build();
+
+    TableConfig mvTableConfig = new TableConfigBuilder(TableType.OFFLINE)
+        .setTableName("mv_orders_ms")
+        .setTimeColumnName("dayStr")
+        .build();
+    Map<String, String> taskConfigs = buildTaskConfigs(sql);
+
+    expectErrorRaw(withLimit(sql), mvSchema, mvTableConfig, taskConfigs,
+        "SIMPLE_DATE_FORMAT");
+  }
+
+  @Test
+  public void testStep7UnsupportedFunctionRejected() {
+    // fromEpochDays is a real Pinot scalar but is intentionally not in the MV time-expr
+    // whitelist (v1). The rejection message must enumerate the supported set so the user
+    // can self-correct without consulting source code.
+    String sql = "SELECT fromEpochDays(DaysSinceEpoch) AS ts_ms, city, count(*) AS cnt "
+        + "FROM orders GROUP BY ts_ms, city";
+    Schema mvSchema = new Schema.SchemaBuilder()
+        .addSingleValueDimension("city", FieldSpec.DataType.STRING)
+        .addMetric("cnt", FieldSpec.DataType.LONG)
+        .addDateTime("ts_ms", FieldSpec.DataType.LONG, "1:MILLISECONDS:EPOCH", "1:MILLISECONDS")
+        .build();
+
+    TableConfig mvTableConfig = new TableConfigBuilder(TableType.OFFLINE)
+        .setTableName("mv_orders")
+        .setTimeColumnName("ts_ms")
+        .build();
+    Map<String, String> taskConfigs = buildTaskConfigs(sql);
+
+    try {
+      MaterializedViewAnalyzer.analyze(withLimit(sql), mvTableConfig, mvSchema, taskConfigs, _mockAccessor);
+      fail("Expected IllegalStateException for unsupported time function");
+    } catch (IllegalStateException e) {
+      String msg = e.getMessage();
+      assertTrue(msg.contains("unsupported function") || msg.contains("Supported"),
+          "Expected message to flag unsupported function, got: " + msg);
+      // Whitelist must be visible.
+      assertTrue(msg.contains("datetimeconvert") && msg.contains("datetrunc") && msg.contains("todatetime"),
+          "Expected supported-set hint in message, got: " + msg);
+    }
+  }
+
+  @Test
+  public void testStep7ArithmeticTimeExprRejected() {
+    // ts / 86400 parses as divide(ts, 86400) — not in the time-function whitelist, so the
+    // generic "unsupported function" path fires here too.
+    useMillisecondsBase();
+    String sql = "SELECT ts / 86400 AS dayBucket, city, count(*) AS cnt "
+        + "FROM orders_ms GROUP BY dayBucket, city";
+    Schema mvSchema = new Schema.SchemaBuilder()
+        .addSingleValueDimension("city", FieldSpec.DataType.STRING)
+        .addMetric("cnt", FieldSpec.DataType.LONG)
+        .addDateTime("dayBucket", FieldSpec.DataType.LONG, "1:DAYS:EPOCH", "1:DAYS")
+        .build();
+
+    TableConfig mvTableConfig = new TableConfigBuilder(TableType.OFFLINE)
+        .setTableName("mv_orders_ms")
+        .setTimeColumnName("dayBucket")
+        .build();
+    Map<String, String> taskConfigs = buildTaskConfigs(sql);
+
+    expectErrorRaw(withLimit(sql), mvSchema, mvTableConfig, taskConfigs, "unsupported function");
+  }
+
+  @Test
+  public void testStep7NestedFunctionRejected() {
+    // Nested call: date_trunc(...) is not a bare identifier, so dateTimeConvert's first-arg
+    // check fires. v1 rejects nesting outright; users must inline a single transformation.
+    useMillisecondsBase();
+    String sql = "SELECT dateTimeConvert(date_trunc('DAY', ts), '1:MILLISECONDS:EPOCH', "
+        + "'1:DAYS:EPOCH', '1:DAYS') AS day, city, count(*) AS cnt FROM orders_ms "
+        + "GROUP BY dateTimeConvert(date_trunc('DAY', ts), '1:MILLISECONDS:EPOCH', "
+        + "'1:DAYS:EPOCH', '1:DAYS'), city";
+    Schema mvSchema = new Schema.SchemaBuilder()
+        .addSingleValueDimension("city", FieldSpec.DataType.STRING)
+        .addMetric("cnt", FieldSpec.DataType.LONG)
+        .addDateTime("day", FieldSpec.DataType.LONG, "1:DAYS:EPOCH", "1:DAYS")
+        .build();
+
+    TableConfig mvTableConfig = new TableConfigBuilder(TableType.OFFLINE)
+        .setTableName("mv_orders_ms")
+        .setTimeColumnName("day")
+        .build();
+    Map<String, String> taskConfigs = buildTaskConfigs(sql);
+
+    expectErrorRaw(withLimit(sql), mvSchema, mvTableConfig, taskConfigs,
+        "first argument must be the base time column");
   }
 
   // -----------------------------------------------------------------------
@@ -675,7 +1020,16 @@ public class MaterializedViewAnalyzerTest {
    */
   private void expectErrorRaw(String sql, Schema mvSchema, Map<String, String> taskConfigs,
       String expectedMessageFragment) {
-    TableConfig mvTableConfig = buildMvTableConfig();
+    expectErrorRaw(sql, mvSchema, buildMvTableConfig(), taskConfigs, expectedMessageFragment);
+  }
+
+  /**
+   * Variant that lets the caller supply a custom MV {@link TableConfig} (e.g. with a
+   * SELECT-alias time column name). Step-7 tests need this because the time column is
+   * usually an alias of the base time column.
+   */
+  private void expectErrorRaw(String sql, Schema mvSchema, TableConfig mvTableConfig,
+      Map<String, String> taskConfigs, String expectedMessageFragment) {
     try {
       MaterializedViewAnalyzer.analyze(sql, mvTableConfig, mvSchema, taskConfigs, _mockAccessor);
       fail("Expected IllegalStateException containing: " + expectedMessageFragment);
@@ -683,6 +1037,28 @@ public class MaterializedViewAnalyzerTest {
       assertTrue(e.getMessage().contains(expectedMessageFragment),
           "Expected message containing '" + expectedMessageFragment + "', got: " + e.getMessage());
     }
+  }
+
+  /**
+   * Wires a MILLISECONDS-based source table {@code orders_ms} into the mock accessor.
+   * Step-7 tests for {@code date_trunc} / {@code toDateTime} need a millis base because both
+   * rules require a unitary EPOCH base and {@code date_trunc}'s default inputTimeUnit is
+   * MILLISECONDS — using the default DAYS-based source would force every test to also pass
+   * an explicit {@code inputTimeUnit}, obscuring what's actually being tested.
+   */
+  private void useMillisecondsBase() {
+    String tableName = "orders_ms_OFFLINE";
+    TableConfig cfg = new TableConfigBuilder(TableType.OFFLINE)
+        .setTableName(tableName)
+        .setTimeColumnName("ts")
+        .build();
+    Schema schema = new Schema.SchemaBuilder()
+        .addSingleValueDimension("city", FieldSpec.DataType.STRING)
+        .addMetric("amount", FieldSpec.DataType.DOUBLE)
+        .addDateTime("ts", FieldSpec.DataType.LONG, "1:MILLISECONDS:EPOCH", "1:MILLISECONDS")
+        .build();
+    when(_mockAccessor.getTableConfig(tableName)).thenReturn(cfg);
+    when(_mockAccessor.getTableSchema(tableName)).thenReturn(schema);
   }
 
   /** Returns {@code sql} as-is if it already ends with a LIMIT clause, otherwise appends one. */
