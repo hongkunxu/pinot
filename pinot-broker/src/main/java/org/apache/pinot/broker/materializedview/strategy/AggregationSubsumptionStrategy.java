@@ -42,15 +42,30 @@ import org.apache.pinot.sql.parsers.CalciteSqlParser;
 /**
  * Subsumption strategy for <b>aggregation</b> queries.
  *
- * <p>The rewritten query always retains GROUP BY and wraps aggregation
- * columns with re-aggregation functions via
- * {@link AggregationEquivalenceRegistry} (e.g. {@code SUM(col)} on the user
- * query becomes {@code SUM(sum_col)} on the MV). When the MV's GROUP BY
- * granularity matches the user query exactly, each group contains a single
- * pre-computed row, so the re-aggregation is effectively a no-op — but it
- * guarantees that the server produces an aggregation intermediate DataTable,
- * which is critical for split-mode merging where both sides must use the
- * same schema.
+ * <p>The rewritten query wraps aggregation columns with re-aggregation
+ * functions via {@link AggregationEquivalenceRegistry} (e.g. {@code SUM(col)}
+ * on the user query becomes {@code SUM(sum_col)} on the MV). When the MV's
+ * GROUP BY granularity matches the user query exactly, each group contains
+ * a single pre-computed row, so the re-aggregation is effectively a no-op —
+ * but it guarantees that the server produces an aggregation intermediate
+ * DataTable, which is critical for split-mode merging where both sides must
+ * use the same schema.
+ *
+ * <p>The user query's GROUP BY may be a (non-strict) subset of the MV's
+ * GROUP BY, including the empty subset. The supported cases are therefore:
+ * <ul>
+ *   <li><b>Same granularity</b> — user GROUP BY equals MV GROUP BY; the
+ *       rewritten query keeps the same grouping columns.</li>
+ *   <li><b>Coarser granularity</b> — user GROUP BY is a strict subset of MV
+ *       GROUP BY; re-aggregation merges the finer MV partitions into the
+ *       coarser user grouping.</li>
+ *   <li><b>Global aggregation</b> — user has no GROUP BY at all (e.g.
+ *       {@code SELECT SUM(rev) FROM orders}); re-aggregation merges every MV
+ *       partition into a single output row. The rewritten query carries no
+ *       GROUP BY clause.</li>
+ * </ul>
+ * The MV itself must always have a GROUP BY; an MV without GROUP BY is
+ * already a global summary and is handled by {@code ExactSubsumptionStrategy}.
  *
  * <p>Cost model:
  * <ul>
@@ -76,9 +91,23 @@ public class AggregationSubsumptionStrategy extends AbstractSubsumptionStrategy 
     List<Expression> userGroupBy = userQuery.getGroupByList();
     List<Expression> mvGroupBy = mvQuery.getGroupByList();
 
-    if (userGroupBy == null || userGroupBy.isEmpty()
-        || mvGroupBy == null || mvGroupBy.isEmpty()) {
+    // The MV must be partitioned by some grouping for re-aggregation to be
+    // meaningful. If the MV has no GROUP BY it is already a global summary
+    // and ExactSubsumptionStrategy is the right matcher.
+    if (mvGroupBy == null || mvGroupBy.isEmpty()) {
       return false;
+    }
+
+    // A user query with no GROUP BY is the global-aggregation case (e.g.
+    // SELECT SUM(rev) FROM orders). The shape gate guarantees the SELECT list
+    // contains at least one aggregation function. Re-aggregating all MV rows
+    // into a single output row is well-defined for every currently-registered
+    // AggregationEquivalence rule (SUM/MIN/MAX/COUNT/sketches); AVG is rejected
+    // separately at projectionSubsumes because no AVG rule is registered.
+    // Treat null/empty userGroupBy as the empty subset, which is trivially
+    // contained in mvSet.
+    if (userGroupBy == null || userGroupBy.isEmpty()) {
+      return true;
     }
 
     Set<Expression> userSet = new HashSet<>(userGroupBy);
@@ -270,12 +299,17 @@ public class AggregationSubsumptionStrategy extends AbstractSubsumptionStrategy 
         buildReAggSelectList(userQuery.getSelectList(), mvProjectionMap));
 
     List<Expression> userGroupBy = userQuery.getGroupByList();
-    List<Expression> remappedGroupBy = new ArrayList<>(userGroupBy.size());
-    for (Expression gbExpr : userGroupBy) {
-      String mvCol = mvProjectionMap.get(gbExpr);
-      remappedGroupBy.add(RequestUtils.getIdentifierExpression(mvCol));
+    if (userGroupBy != null && !userGroupBy.isEmpty()) {
+      List<Expression> remappedGroupBy = new ArrayList<>(userGroupBy.size());
+      for (Expression gbExpr : userGroupBy) {
+        String mvCol = mvProjectionMap.get(gbExpr);
+        remappedGroupBy.add(RequestUtils.getIdentifierExpression(mvCol));
+      }
+      rewritten.setGroupByList(remappedGroupBy);
     }
-    rewritten.setGroupByList(remappedGroupBy);
+    // Else: global aggregation — userQuery.deepCopy() above already preserves
+    // the unset/empty GROUP BY state, so the rewritten MV query produces a
+    // single global row by re-aggregating across all MV partitions.
 
     Expression originalHaving = userQuery.getHavingExpression();
     if (originalHaving != null) {

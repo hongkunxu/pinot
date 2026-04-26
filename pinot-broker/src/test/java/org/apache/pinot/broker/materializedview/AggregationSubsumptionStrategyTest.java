@@ -857,4 +857,142 @@ public class AggregationSubsumptionStrategyTest {
     assertTrue(result.isSplitSafe(),
         "SUM->SUM is distributive and must remain split-safe.");
   }
+
+  // =======================================================================
+  //  Global aggregation against grouped MV (no user GROUP BY)
+  // =======================================================================
+
+  /**
+   * The user issues a global SUM with no GROUP BY against an MV grouped by
+   * category. Re-aggregation of {@code SUM(rev_sum)} across all MV partitions
+   * yields the global SUM, so the match must succeed and the rewritten query
+   * must carry no GROUP BY.
+   */
+  @Test
+  public void testGlobalSumAggregationAgainstGroupedMv() {
+    String definedSql =
+        "SELECT category, SUM(revenue) AS rev_sum FROM orders GROUP BY category";
+    MvMetadataCache.MvCacheEntry entry = createEntry("mv_orders_OFFLINE", "orders", definedSql);
+
+    PinotQuery userQuery = CalciteSqlParser.compileToPinotQuery(
+        "SELECT SUM(revenue) FROM orders");
+    MvRewritePlan result = _strategy.match(userQuery, entry);
+
+    assertNotNull(result, "Global SUM must subsume into a grouped MV via re-aggregation");
+    assertEquals(result.getCost(), 6.0);
+    assertTrue(result.isSplitSafe(), "Pure SUM->SUM remains split-safe even for global aggregation");
+
+    PinotQuery rewritten = result.getMvQuery();
+    assertTrue(rewritten.getGroupByList() == null || rewritten.getGroupByList().isEmpty(),
+        "Rewritten query for a global aggregation must carry no GROUP BY");
+
+    List<Expression> selectList = rewritten.getSelectList();
+    assertEquals(selectList.size(), 1);
+    // SUM(revenue) → SUM(rev_sum)
+    Function reAgg = selectList.get(0).getFunctionCall();
+    assertNotNull(reAgg);
+    assertEquals(reAgg.getOperator(), "sum");
+    assertEquals(reAgg.getOperands().get(0).getIdentifier().getName(), "rev_sum");
+  }
+
+  /**
+   * Global COUNT(*) against a grouped MV that pre-aggregates
+   * {@code COUNT(*) AS order_count}. The match must succeed via
+   * PassthroughEquivalence(COUNT, SUM), and — because COUNT->SUM is
+   * structurally not split-safe (LONG vs DOUBLE intermediates) — the plan
+   * must report {@code isSplitSafe()=false}, mirroring the earlier
+   * regression fix in {@link #testCountStarWithDirectMvProjectionIsNotSplitSafe}.
+   */
+  @Test
+  public void testGlobalCountStarAgainstGroupedMv() {
+    String definedSql =
+        "SELECT category, COUNT(*) AS order_count FROM orders GROUP BY category";
+    MvMetadataCache.MvCacheEntry entry = createEntry("mv_orders_OFFLINE", "orders", definedSql);
+
+    PinotQuery userQuery = CalciteSqlParser.compileToPinotQuery(
+        "SELECT COUNT(*) FROM orders");
+    MvRewritePlan result = _strategy.match(userQuery, entry);
+
+    assertNotNull(result, "Global COUNT(*) must subsume into a grouped MV via SUM(order_count)");
+    assertFalse(result.isSplitSafe(),
+        "COUNT->SUM equivalence must remain non-split-safe even in the global-aggregation case "
+            + "to prevent base/MV intermediate type mismatch (LONG vs DOUBLE) at the reducer.");
+
+    PinotQuery rewritten = result.getMvQuery();
+    assertTrue(rewritten.getGroupByList() == null || rewritten.getGroupByList().isEmpty(),
+        "Rewritten global COUNT(*) must carry no GROUP BY");
+
+    List<Expression> selectList = rewritten.getSelectList();
+    assertEquals(selectList.size(), 1);
+    // COUNT(*) → SUM(order_count)
+    Function reAgg = selectList.get(0).getFunctionCall();
+    assertNotNull(reAgg);
+    assertEquals(reAgg.getOperator(), "sum");
+    assertEquals(reAgg.getOperands().get(0).getIdentifier().getName(), "order_count");
+  }
+
+  /**
+   * Global mixed aggregation (SUM, MIN, MAX) against a grouped MV. All three
+   * are distributive over partition coarsening, so re-aggregating across all
+   * MV partitions must yield the correct global values, and the plan must
+   * remain split-safe.
+   */
+  @Test
+  public void testGlobalMixedAggregationAgainstGroupedMv() {
+    String definedSql =
+        "SELECT category, SUM(revenue) AS rev_sum, MIN(revenue) AS rev_min, "
+            + "MAX(revenue) AS rev_max FROM orders GROUP BY category";
+    MvMetadataCache.MvCacheEntry entry = createEntry("mv_orders_OFFLINE", "orders", definedSql);
+
+    PinotQuery userQuery = CalciteSqlParser.compileToPinotQuery(
+        "SELECT SUM(revenue), MIN(revenue), MAX(revenue) FROM orders");
+    MvRewritePlan result = _strategy.match(userQuery, entry);
+
+    assertNotNull(result, "Global SUM/MIN/MAX must subsume into a grouped MV");
+    assertEquals(result.getCost(), 6.0);
+    assertTrue(result.isSplitSafe(),
+        "SUM->SUM, MIN->MIN, MAX->MAX are all distributive and must remain split-safe.");
+
+    PinotQuery rewritten = result.getMvQuery();
+    assertTrue(rewritten.getGroupByList() == null || rewritten.getGroupByList().isEmpty(),
+        "Rewritten query for global aggregation must carry no GROUP BY");
+
+    List<Expression> selectList = rewritten.getSelectList();
+    assertEquals(selectList.size(), 3);
+    // SUM(revenue) → SUM(rev_sum)
+    Function sumReAgg = selectList.get(0).getFunctionCall();
+    assertEquals(sumReAgg.getOperator(), "sum");
+    assertEquals(sumReAgg.getOperands().get(0).getIdentifier().getName(), "rev_sum");
+    // MIN(revenue) → MIN(rev_min)
+    Function minReAgg = selectList.get(1).getFunctionCall();
+    assertEquals(minReAgg.getOperator(), "min");
+    assertEquals(minReAgg.getOperands().get(0).getIdentifier().getName(), "rev_min");
+    // MAX(revenue) → MAX(rev_max)
+    Function maxReAgg = selectList.get(2).getFunctionCall();
+    assertEquals(maxReAgg.getOperator(), "max");
+    assertEquals(maxReAgg.getOperands().get(0).getIdentifier().getName(), "rev_max");
+  }
+
+  /**
+   * Even with the relaxed group-by gate, AVG must still be rejected: there is
+   * no AVG rule registered in {@link
+   * org.apache.pinot.broker.materializedview.equivalence.AggregationEquivalenceRegistry},
+   * so {@code projectionSubsumes} fails before re-aggregation can be
+   * attempted. This guards against a regression where the relaxation in
+   * {@code groupByMatches} accidentally lets AVG through some other path.
+   */
+  @Test
+  public void testGlobalAvgAgainstGroupedMvIsRejected() {
+    String definedSql =
+        "SELECT category, AVG(revenue) AS avg_rev FROM orders GROUP BY category";
+    MvMetadataCache.MvCacheEntry entry = createEntry("mv_orders_OFFLINE", "orders", definedSql);
+
+    PinotQuery userQuery = CalciteSqlParser.compileToPinotQuery(
+        "SELECT AVG(revenue) FROM orders");
+    MvRewritePlan result = _strategy.match(userQuery, entry);
+
+    assertNull(result,
+        "AVG has no re-aggregation rule; global AVG over a grouped MV must be rejected at "
+            + "the projection step, regardless of the relaxed group-by gate.");
+  }
 }
