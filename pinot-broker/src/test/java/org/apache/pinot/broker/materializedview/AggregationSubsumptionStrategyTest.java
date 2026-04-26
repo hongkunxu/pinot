@@ -589,6 +589,12 @@ public class AggregationSubsumptionStrategyTest {
 
     assertNotNull(result, "COUNT -> SUM re-aggregation should work");
     assertEquals(result.getCost(), 6.0);
+    // COUNT->SUM is structurally unsafe to split: base side returns LONG
+    // intermediates (CountAggregationFunction), MV side returns DOUBLE
+    // intermediates (SumAggregationFunction). The reducer would mis-cast.
+    assertFalse(result.isSplitSafe(),
+        "COUNT->SUM equivalence must be marked as not split-safe so MvQueryRewriteEngine "
+            + "rejects SPLIT_REWRITE and falls back to base table.");
 
     PinotQuery rewritten = result.getMvQuery();
     List<Expression> selectList = rewritten.getSelectList();
@@ -791,5 +797,64 @@ public class AggregationSubsumptionStrategyTest {
     // ORDER BY should reference SUM(sum_rev), wrapped in ordering
     String orderByStr = rewritten.getOrderByList().get(0).toString();
     assertTrue(orderByStr.contains("sum_rev"));
+  }
+
+  // =======================================================================
+  //  isSplitSafe regression tests
+  // =======================================================================
+
+  @Test
+  public void testCountStarWithDirectMvProjectionIsNotSplitSafe() {
+    // Regression for the isSplitSafe short-circuit bug: when the user query has
+    // COUNT(*) and the MV definedSQL also has the SAME COUNT(*) expression as a
+    // direct projection, mvProjectionMap.containsKey(COUNT(*)) returns true.
+    // The original `&& !mvProjectionMap.containsKey(stripped)` short-circuit
+    // skipped the equivalence-rule check, marking the plan split-safe even
+    // though the actual rewrite still routes COUNT(*) through
+    // PassthroughEquivalence(COUNT, SUM) -> SUM(order_count). SPLIT_REWRITE
+    // then produced mismatched DataTables (base=LONG vs MV=DOUBLE) and the
+    // reducer threw ClassCastException(Double -> Long).
+    String definedSql =
+        "SELECT category, country, SUM(revenue) AS revenue_sum, COUNT(*) AS order_count "
+            + "FROM orders GROUP BY category, country";
+    MvMetadataCache.MvCacheEntry entry = createEntry("mv_orders_OFFLINE", "orders", definedSql);
+
+    PinotQuery userQuery = CalciteSqlParser.compileToPinotQuery(
+        "SELECT category, country, SUM(revenue), COUNT(*) FROM orders GROUP BY category, country");
+    MvRewritePlan result = _strategy.match(userQuery, entry);
+
+    assertNotNull(result, "Aggregation subsumption must still match the MV");
+    assertFalse(result.isSplitSafe(),
+        "COUNT(*) rewritten via PassthroughEquivalence(COUNT, SUM) must not be split-safe, "
+            + "even when the MV projects the same COUNT(*) expression directly.");
+
+    // Sanity-check that the rewrite still goes through the equivalence rule
+    // (and not the bare-column fast path). COUNT(*) -> SUM(order_count).
+    PinotQuery rewritten = result.getMvQuery();
+    List<Expression> selectList = rewritten.getSelectList();
+    Function countReAgg = selectList.get(3).getFunctionCall();
+    assertNotNull(countReAgg);
+    assertEquals(countReAgg.getOperator(), "sum");
+    assertEquals(countReAgg.getOperands().get(0).getIdentifier().getName(), "order_count");
+  }
+
+  @Test
+  public void testAllSumPlanIsSplitSafe() {
+    // Reverse guard: a plan that uses only distributive same-function rules
+    // (SUM -> SUM) must remain split-safe. Without this assertion a future
+    // over-correction of isSplitSafe could silently disable SPLIT_REWRITE for
+    // every aggregation MV.
+    String definedSql =
+        "SELECT category, country, SUM(revenue) AS revenue_sum, SUM(quantity) AS quantity_sum "
+            + "FROM orders GROUP BY category, country";
+    MvMetadataCache.MvCacheEntry entry = createEntry("mv_orders_OFFLINE", "orders", definedSql);
+
+    PinotQuery userQuery = CalciteSqlParser.compileToPinotQuery(
+        "SELECT category, country, SUM(revenue), SUM(quantity) FROM orders GROUP BY category, country");
+    MvRewritePlan result = _strategy.match(userQuery, entry);
+
+    assertNotNull(result);
+    assertTrue(result.isSplitSafe(),
+        "SUM->SUM is distributive and must remain split-safe.");
   }
 }

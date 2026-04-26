@@ -313,13 +313,27 @@ public class AggregationSubsumptionStrategy extends AbstractSubsumptionStrategy 
       Map<Expression, String> mvProjectionMap) {
     for (Expression expr : userSelectList) {
       Expression stripped = MvMatchUtils.stripAlias(expr);
-      if (stripped.getFunctionCall() != null && !mvProjectionMap.containsKey(stripped)) {
-        Object[] match = findEquivalentMvEntry(stripped, mvProjectionMap);
-        if (match != null) {
-          AggregationEquivalence rule = (AggregationEquivalence) match[1];
-          if (!rule.isSplitSafe()) {
-            return false;
-          }
+      // Only function-call SELECT items go through aggregation re-write in
+      // buildReAggSelectList. Bare identifiers (e.g. group-by columns echoed in
+      // the SELECT list) never invoke an AggregationEquivalence rule, so they
+      // cannot affect split-safety.
+      if (stripped.getFunctionCall() == null) {
+        continue;
+      }
+      // Do NOT short-circuit on mvProjectionMap.containsKey(stripped). Even when
+      // the MV projects the user's exact function expression (e.g. user has
+      // COUNT(*) and MV definedSQL also has COUNT(*) AS order_count), the actual
+      // rewrite in buildReAggSelectList still routes through
+      // rewriteAggregationExpression -> AggregationEquivalence (PassthroughEquivalence
+      // turns COUNT into SUM(order_count)) because its bare-column fast path
+      // additionally requires stripped.getFunctionCall() == null. The equivalence
+      // rule's split-safety declaration must therefore be consulted for every
+      // function-call SELECT item, including direct-projection matches.
+      Object[] match = findEquivalentMvEntry(stripped, mvProjectionMap);
+      if (match != null) {
+        AggregationEquivalence rule = (AggregationEquivalence) match[1];
+        if (!rule.isSplitSafe()) {
+          return false;
         }
       }
     }
